@@ -3,6 +3,17 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/_legacy/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/_legacy/infra/local/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/_legacy/pecas/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/envs/hetzner/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/envs/local/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/infra/local/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/modules/core-platform/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/modules/workload/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/pecas/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/platform/hetzner/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/platform/local/.terraform" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

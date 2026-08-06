@@ -1,0 +1,171 @@
+name: terraform-pr
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  TERRAFORM_VERSION: 1.9.8
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  fmt-check:
+    name: fmt-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check (all layers)
+        run: |
+          set -e
+          for d in envs/hetzner envs/local platform/hetzner platform/local modules/core-platform modules/workload; do
+            echo "==> fmt-check $d"
+            terraform fmt -check -recursive "$d"
+          done
+
+  validate:
+    name: validate (${{ matrix.layer }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        layer:
+          - envs/hetzner
+          - envs/local
+          - platform/hetzner
+          - platform/local
+          - modules/core-platform
+          - modules/workload
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init -backend=false
+        working-directory: ${{ matrix.layer }}
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        working-directory: ${{ matrix.layer }}
+        run: terraform validate
+
+  plan-hetzner:
+    name: plan-hetzner
+    runs-on: ubuntu-latest
+    needs:
+      - fmt-check
+      - validate
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: terraform-plan-hetzner-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Write secret files
+        env:
+          ENVS_HETZNER_BACKEND_HCL: ${{ secrets.ENVS_HETZNER_BACKEND_HCL }}
+          ENVS_HETZNER_TFVARS: ${{ secrets.ENVS_HETZNER_TFVARS }}
+          PLATFORM_HETZNER_BACKEND_HCL: ${{ secrets.PLATFORM_HETZNER_BACKEND_HCL }}
+          PLATFORM_HETZNER_TFVARS: ${{ secrets.PLATFORM_HETZNER_TFVARS }}
+        run: |
+          printf '%s\n' "$ENVS_HETZNER_BACKEND_HCL" > envs/hetzner/backend.hcl
+          printf '%s\n' "$ENVS_HETZNER_TFVARS"     > envs/hetzner/terraform.tfvars
+          printf '%s\n' "$PLATFORM_HETZNER_BACKEND_HCL" > platform/hetzner/backend.hcl
+          printf '%s\n' "$PLATFORM_HETZNER_TFVARS"     > platform/hetzner/terraform.tfvars
+
+      - name: Validate backend.hcl flags
+        run: |
+          set -e
+          for f in envs/hetzner/backend.hcl platform/hetzner/backend.hcl; do
+            grep -Eq '^[[:space:]]*encrypt[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$f" \
+              || { echo "ERRO: $f deve conter encrypt = true."; exit 1; }
+            grep -Eq '^[[:space:]]*use_lockfile[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$f" \
+              || { echo "ERRO: $f deve conter use_lockfile = true."; exit 1; }
+          done
+
+      - name: Plan envs/hetzner
+        id: plan_envs
+        working-directory: envs/hetzner
+        run: |
+          terraform init -backend-config=backend.hcl -input=false
+          terraform validate
+          terraform plan -input=false -no-color -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Plan platform/hetzner
+        id: plan_platform
+        working-directory: platform/hetzner
+        run: |
+          terraform init -backend-config=backend.hcl -input=false
+          terraform validate
+          terraform plan -input=false -no-color -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Upload tfplan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hetzner-tfplans
+          retention-days: 7
+          path: |
+            envs/hetzner/tfplan
+            envs/hetzner/plan.txt
+            platform/hetzner/tfplan
+            platform/hetzner/plan.txt
+
+      - name: Comment plan summary on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const MAX = 60000;
+
+            const sections = [
+              { title: 'envs/hetzner',     path: 'envs/hetzner/plan.txt' },
+              { title: 'platform/hetzner', path: 'platform/hetzner/plan.txt' },
+            ];
+
+            let body = '## Terraform Plan (hetzner)\n\n';
+            for (const s of sections) {
+              body += `### ${s.title}\n\n`;
+              if (!fs.existsSync(s.path)) {
+                body += '_plan não gerado (step anterior falhou)_\n\n';
+                continue;
+              }
+              let txt = fs.readFileSync(s.path, 'utf8');
+              if (txt.length > MAX) txt = txt.slice(0, MAX) + '\n\n... (truncado)';
+              body += '```hcl\n' + txt + '\n```\n\n';
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });

@@ -1,0 +1,8 @@
+bucket       = "CHANGE_ME-terraform-state"
+key          = "workerless-terraforms/envs/hetzner/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true
+
+# Optional when not using standard AWS environment credentials.
+# profile = "default"

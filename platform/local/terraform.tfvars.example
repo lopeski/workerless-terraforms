@@ -1,0 +1,72 @@
+# Copie este arquivo para terraform.tfvars (gitignored) e ajuste.
+#
+# Padrão local-dev:
+#   - `external_secret_ref.secret_store_name = "dev-secrets"` aponta para o
+#     ClusterSecretStore (kind: kubernetes) provisionado em main.tf, que lê
+#     Secrets nativos do namespace `dev-secrets`.
+#   - Edite o `kubernetes_secret_v1.dev_workload_credentials` (em main.tf,
+#     ou via `kubectl edit secret -n dev-secrets`) para injetar credenciais
+#     reais de broker/DB local (Docker, host.docker.internal, etc.).
+#
+# Em produção (platform/hetzner) o store aponta para Vault/AWS Secrets
+# Manager/etc. provisionado fora do Terraform — workloads não mudam.
+#
+# prometheus_node_port (default 30090, opcional): deve bater com o mesmo
+# valor em envs/local/terraform.tfvars se sobrescrito. O output
+# `prometheus_url` (http://localhost:<porta>) é o valor a usar em
+# OBSERVABILITY_PROMETHEUS_URL no workerless-api.
+
+plans = {
+  starter = {
+    quota = {
+      "requests.cpu"    = "200m"
+      "requests.memory" = "256Mi"
+      "limits.cpu"      = "500m"
+      "limits.memory"   = "512Mi"
+      "pods"            = "5"
+    }
+
+    container = {
+      default_cpu            = "50m"
+      default_memory         = "64Mi"
+      default_request_cpu    = "10m"
+      default_request_memory = "16Mi"
+      max_cpu                = "100m"
+      max_memory             = "128Mi"
+    }
+
+    max_replicas = 3
+  }
+}
+
+workloads = {
+  "placeholder-consumer" = {
+    tenant_id    = "dev"
+    plan_key     = "starter"
+    worker_image = "registry.k8s.io/pause:3.9"
+    min_replicas = 1
+
+    external_secret_ref = {
+      name              = "placeholder-consumer-credentials"
+      secret_store_name = "dev-secrets"
+      secret_store_kind = "ClusterSecretStore"
+    }
+
+    # Sem broker externo a liberar — cron trigger não precisa de egress.
+    # Para um worker real apontando para RabbitMQ/Kafka em Docker, libere
+    # o CIDR/porta do host aqui.
+    event_source_egress_rules = []
+
+    # KEDA exige >=1 trigger; cron mantém desiredReplicas=1 durante todo o
+    # dia UTC sem depender de broker.
+    keda_triggers = [{
+      type = "cron"
+      metadata = {
+        timezone        = "UTC"
+        start           = "0 0 * * *"
+        end             = "59 23 * * *"
+        desiredReplicas = "1"
+      }
+    }]
+  }
+}

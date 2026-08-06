@@ -1,0 +1,69 @@
+name: terraform-apply
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'envs/hetzner/**'
+      - 'platform/hetzner/**'
+      - 'modules/**'
+      - 'build.hetzner.sh'
+      - '.github/workflows/terraform-apply.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-apply-hetzner
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: 1.9.8
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  apply-hetzner:
+    name: apply-hetzner
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      TF_VAR_hcloud_token: ${{ secrets.HCLOUD_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Write secret files
+        env:
+          ENVS_HETZNER_BACKEND_HCL: ${{ secrets.ENVS_HETZNER_BACKEND_HCL }}
+          ENVS_HETZNER_TFVARS: ${{ secrets.ENVS_HETZNER_TFVARS }}
+          PLATFORM_HETZNER_BACKEND_HCL: ${{ secrets.PLATFORM_HETZNER_BACKEND_HCL }}
+          PLATFORM_HETZNER_TFVARS: ${{ secrets.PLATFORM_HETZNER_TFVARS }}
+        run: |
+          printf '%s\n' "$ENVS_HETZNER_BACKEND_HCL" > envs/hetzner/backend.hcl
+          printf '%s\n' "$ENVS_HETZNER_TFVARS"     > envs/hetzner/terraform.tfvars
+          printf '%s\n' "$PLATFORM_HETZNER_BACKEND_HCL" > platform/hetzner/backend.hcl
+          printf '%s\n' "$PLATFORM_HETZNER_TFVARS"     > platform/hetzner/terraform.tfvars
+
+      - name: Run build.hetzner.sh
+        run: |
+          chmod +x build.hetzner.sh
+          ./build.hetzner.sh
+
+      - name: Upload applied tfplans
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hetzner-applied-tfplans
+          retention-days: 30
+          path: |
+            envs/hetzner/tfplan
+            platform/hetzner/tfplan

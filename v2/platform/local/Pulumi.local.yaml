@@ -1,0 +1,36 @@
+config:
+  workerless-platform-local:clusterStackRef: organization/workerless-envs-local/local
+  workerless-platform-local:plans:
+    starter:
+      quota:
+        requestsCpu: "200m"
+        requestsMemory: "256Mi"
+        limitsCpu: "500m"
+        limitsMemory: "512Mi"
+        pods: "5"
+      container:
+        defaultCpu: "50m"
+        defaultMemory: "64Mi"
+        defaultRequestCpu: "10m"
+        defaultRequestMemory: "16Mi"
+        maxCpu: "100m"
+        maxMemory: "128Mi"
+      maxReplicas: 3
+  workerless-platform-local:workloads:
+    placeholder-consumer:
+      tenantId: dev
+      planKey: starter
+      workerImage: "registry.k8s.io/pause:3.9"
+      minReplicas: 1
+      externalSecretRef:
+        name: placeholder-consumer-credentials
+        secretStoreName: dev-secrets
+        secretStoreKind: ClusterSecretStore
+      eventSourceEgressRules: []
+      kedaTriggers:
+        - type: cron
+          metadata:
+            timezone: UTC
+            start: "0 0 * * *"
+            end: "59 23 * * *"
+            desiredReplicas: "1"

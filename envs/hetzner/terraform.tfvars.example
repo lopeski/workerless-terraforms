@@ -1,0 +1,28 @@
+# Copy this file to terraform.tfvars (gitignored) and fill in real values.
+
+hcloud_token = "CHANGE_ME"
+
+# Required. Use your office/VPN/bastion public CIDRs. Never use 0.0.0.0/0.
+admin_cidrs = [
+  "203.0.113.25/32",
+  "198.51.100.0/24",
+]
+
+# Required. Public CIDR(s) of the host running the PaaS control-plane API
+# (e.g. workerless-api), authorized to reach the Kubernetes API (6443) and
+# Prometheus (prometheus_node_port) — but NOT SSH. Never use 0.0.0.0/0.
+control_plane_cidrs = [
+  "203.0.113.50/32",
+]
+
+# Must match platform/hetzner's prometheus_node_port.
+prometheus_node_port = 30090
+
+server_type        = "cax11"
+worker_count       = 2
+worker_server_type = "cax21"
+server_location    = "ash"
+network_zone       = "us-east"
+
+etcd_snapshot_schedule_cron = "0 */6 * * *"
+etcd_snapshot_retention     = 14

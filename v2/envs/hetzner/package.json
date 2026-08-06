@@ -1,0 +1,19 @@
+{
+  "name": "workerless-envs-hetzner",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pulumi/pulumi": "^3.0.0",
+    "@pulumi/command": "^1.0.0",
+    "@pulumi/hcloud": "^1.0.0",
+    "@workerless/cluster-hetzner": "*",
+    "@workerless/types": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "ts-node": "^10.9.2",
+    "@types/node": "^20.0.0"
+  }
+}

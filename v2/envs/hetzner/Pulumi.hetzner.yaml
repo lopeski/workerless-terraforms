@@ -1,0 +1,11 @@
+config:
+  workerless-envs-hetzner:k3sVersion: v1.30.5+k3s1
+  workerless-envs-hetzner:serverType: cax11
+  workerless-envs-hetzner:workerServerType: cax21
+  workerless-envs-hetzner:workerCount: "2"
+  workerless-envs-hetzner:location: ash
+  workerless-envs-hetzner:networkZone: us-east
+  workerless-envs-hetzner:sshPublicKeyPath: ~/.ssh/id_rsa.pub
+  workerless-envs-hetzner:sshPrivateKeyPath: ~/.ssh/id_rsa
+  workerless-envs-hetzner:etcdSnapshotSchedule: "0 */6 * * *"
+  workerless-envs-hetzner:etcdSnapshotRetention: "14"

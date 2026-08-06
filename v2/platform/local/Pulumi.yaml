@@ -1,0 +1,6 @@
+name: workerless-platform-local
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+description: Installs core platform and workloads on the local k3d cluster

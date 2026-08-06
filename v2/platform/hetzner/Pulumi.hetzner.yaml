@@ -1,0 +1,56 @@
+config:
+  workerless-platform-hetzner:clusterStackRef: organization/workerless-envs-hetzner/hetzner
+  workerless-platform-hetzner:plans:
+    starter:
+      quota:
+        requestsCpu: "2"
+        requestsMemory: "1Gi"
+        limitsCpu: "5"
+        limitsMemory: "5Gi"
+        pods: "10"
+      container:
+        defaultCpu: "200m"
+        defaultMemory: "256Mi"
+        defaultRequestCpu: "50m"
+        defaultRequestMemory: "64Mi"
+        maxCpu: "1"
+        maxMemory: "1Gi"
+      maxReplicas: 10
+    growth:
+      quota:
+        requestsCpu: "4"
+        requestsMemory: "4Gi"
+        limitsCpu: "10"
+        limitsMemory: "10Gi"
+        pods: "20"
+      container:
+        defaultCpu: "500m"
+        defaultMemory: "512Mi"
+        defaultRequestCpu: "100m"
+        defaultRequestMemory: "128Mi"
+        maxCpu: "2"
+        maxMemory: "2Gi"
+      maxReplicas: 20
+  workerless-platform-hetzner:workloads:
+    orders-consumer:
+      tenantId: acme
+      planKey: starter
+      workerImage: "ghcr.io/acme/orders-consumer:1.2.3"
+      minReplicas: 0
+      externalSecretRef:
+        name: orders-consumer-credentials
+        secretStoreName: tenant-secrets
+        secretStoreKind: ClusterSecretStore
+      eventSourceEgressRules:
+        - cidr: "203.0.113.10/32"
+          ports:
+            - port: 5671
+      kedaTriggers:
+        - type: rabbitmq
+          metadata:
+            queueName: acme-orders
+            mode: QueueLength
+            value: "5"
+            hostFromEnv: RABBITMQ_CONNECTION_STRING
+      nodeSelector:
+        workerless.io/node-pool: workers

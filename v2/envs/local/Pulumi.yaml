@@ -1,0 +1,6 @@
+name: workerless-envs-local
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+description: Provisions a local k3d cluster for the workerless platform

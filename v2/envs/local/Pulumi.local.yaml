@@ -1,0 +1,5 @@
+config:
+  workerless-envs-local:clusterName: local-rock
+  workerless-envs-local:apiPort: "6550"
+  workerless-envs-local:servers: "1"
+  workerless-envs-local:agents: "1"

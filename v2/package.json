@@ -1,0 +1,13 @@
+{
+  "name": "workerless-v2",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "envs/*",
+    "platform/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}

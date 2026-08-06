@@ -1,0 +1,20 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+.terraform.tfstate.lock.info
+backend.hcl
+
+# Credenciais — copie *.tfvars.example para *.tfvars e preencha
+*.tfvars
+!*.tfvars.example
+
+# Legados preservados como referência, fora do path de apply
+_legacy/
+
+# Planos
+tfplan
+
+# Credenciais locais geradas — nunca commitar
+local-cluster-credentials.md

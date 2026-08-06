@@ -1,0 +1,6 @@
+name: workerless-platform-hetzner
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+description: Installs core platform and workloads on the Hetzner k3s cluster

@@ -1,0 +1,6 @@
+name: workerless-envs-hetzner
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+description: Provisions a Hetzner Cloud k3s HA cluster for the workerless platform

@@ -56,6 +56,15 @@ plans = {
   }
 }
 
+# Required when registry_enabled=true. First apply envs/hetzner, create this
+# DNS A record pointing to registry_load_balancer_ipv4, then create the
+# harbor/harbor-admin Secret through the secrets backend before this apply.
+registry_enabled           = true
+registry_domain            = "registry.example.com"
+acme_email                 = "platform@example.com"
+registry_storage_class     = "hcloud-volumes"
+registry_admin_secret_name = "harbor-admin"
+
 workloads = {
   "orders-consumer" = {
     tenant_id    = "acme"

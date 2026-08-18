@@ -15,6 +15,12 @@
 # valor em envs/local/terraform.tfvars se sobrescrito. O output
 # `prometheus_url` (http://localhost:<porta>) é o valor a usar em
 # OBSERVABILITY_PROMETHEUS_URL no workerless-api.
+# Harbor defaults to http://localhost:5001, local-path persistence and no
+# Trivy. Override registry_admin_password through TF_VAR_...; do not commit it.
+registry_enabled        = true
+registry_node_port      = 30001
+registry_storage_class  = "local-path"
+registry_admin_password = "CHANGE_ME_LOCAL_ONLY"
 
 plans = {
   starter = {

@@ -34,6 +34,8 @@ Broker-specific credentials stay outside Terraform state. Workloads reference an
 ## Development Commands
 
 - `./build.local.sh`: formats, initializes, validates, plans, and applies `envs/local` followed by `platform/local`.
+- `./sync.local-api-env.sh`: explicitly copies the local Kubernetes credentials and Prometheus URL into `../workerless-api/.env` after a successful local build.
+- `./sync.local-api-env.sh --check`: checks whether those four integration values are current without changing the API environment.
 - `./build.hetzner.sh`: same workflow for Hetzner; requires `TF_VAR_hcloud_token`.
 - `terraform fmt -check <dir>`: verify formatting for a specific Terraform directory.
 - `terraform validate`: run inside an initialized Terraform directory to validate configuration.
@@ -65,6 +67,17 @@ cp platform/hetzner/terraform.tfvars.example platform/hetzner/terraform.tfvars
 Set `admin_cidrs` in `envs/hetzner/terraform.tfvars` to real administrative CIDRs for SSH and the Kubernetes API. The configuration rejects `0.0.0.0/0`.
 
 Do not commit secrets, state files, provider binaries, kubeconfigs, or cloud tokens.
+
+### Local API integration
+
+After Terraform has applied the local infrastructure and platform, synchronize the API environment explicitly:
+
+```bash
+./build.local.sh
+./sync.local-api-env.sh
+```
+
+The synchronizer reads the `k3d-local-rock` context without changing the active kubeconfig context. It maps the context server and CA, the sensitive `paas_sa_token` output, and the `prometheus_url` output to `KUBERNETES_SERVER_URL`, `KUBERNETES_CA_DATA_BASE64`, `KUBERNETES_BEARER_TOKEN`, and `OBSERVABILITY_PROMETHEUS_URL`. It preserves all other `.env` values and does not print the token or CA. Pass a different `.env` path as the optional final argument when needed.
 
 ## Hetzner Etcd Restore
 

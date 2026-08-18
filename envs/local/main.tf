@@ -12,9 +12,15 @@ variable "prometheus_node_port" {
   default = 30090
 }
 
+variable "registry_node_port" {
+  description = "NodePort do Harbor publicado como localhost:5001."
+  type        = number
+  default     = 30001
+}
+
 resource "null_resource" "k3d_cluster" {
   triggers = {
-    command = "k3d cluster create local-rock --api-port 6550 --servers 1 --agents 1 --port \"${var.prometheus_node_port}:${var.prometheus_node_port}@server:0\" --wait"
+    command = "k3d cluster create local-rock --api-port 6550 --servers 1 --agents 1 --registry-config \"${path.module}/registries.yaml\" --port \"${var.prometheus_node_port}:${var.prometheus_node_port}@server:0\" --port \"5001:${var.registry_node_port}@server:0\" --wait"
   }
 
   provisioner "local-exec" {

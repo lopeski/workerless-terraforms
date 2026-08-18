@@ -96,6 +96,21 @@ variable "prometheus_node_port" {
   default     = 30090
 }
 
+variable "registry_enabled" {
+  type    = bool
+  default = true
+}
+
+variable "ingress_http_node_port" {
+  type    = number
+  default = 30080
+}
+
+variable "ingress_https_node_port" {
+  type    = number
+  default = 30443
+}
+
 variable "etcd_snapshot_schedule_cron" {
   description = "Cron usado pelo k3s para snapshots automaticos do embedded etcd."
   type        = string
@@ -144,6 +159,22 @@ resource "hcloud_network_subnet" "private" {
 
 resource "hcloud_firewall" "k3s" {
   name = "k3s-cluster"
+
+  rule {
+    direction   = "in"
+    protocol    = "tcp"
+    port        = tostring(var.ingress_http_node_port)
+    source_ips  = ["0.0.0.0/0", "::/0"]
+    description = "Public HTTP forwarded by the registry load balancer"
+  }
+
+  rule {
+    direction   = "in"
+    protocol    = "tcp"
+    port        = tostring(var.ingress_https_node_port)
+    source_ips  = ["0.0.0.0/0", "::/0"]
+    description = "Public HTTPS forwarded by the registry load balancer"
+  }
 
   rule {
     direction   = "in"
@@ -215,6 +246,50 @@ resource "hcloud_firewall" "k3s" {
     port        = "8472"
     source_ips  = ["10.10.1.0/24"]
     description = "flannel VXLAN over private network"
+  }
+}
+
+resource "hcloud_load_balancer" "registry" {
+  count              = var.registry_enabled ? 1 : 0
+  name               = "workerless-registry"
+  load_balancer_type = "lb11"
+  location           = var.server_location
+}
+
+resource "hcloud_load_balancer_target" "registry_servers" {
+  for_each         = var.registry_enabled ? merge({ bootstrap = hcloud_server.bootstrap }, hcloud_server.joiners) : {}
+  type             = "server"
+  load_balancer_id = hcloud_load_balancer.registry[0].id
+  server_id        = each.value.id
+}
+
+resource "hcloud_load_balancer_service" "registry_http" {
+  count            = var.registry_enabled ? 1 : 0
+  load_balancer_id = hcloud_load_balancer.registry[0].id
+  protocol         = "tcp"
+  listen_port      = 80
+  destination_port = var.ingress_http_node_port
+  health_check {
+    protocol = "tcp"
+    port     = var.ingress_http_node_port
+    interval = 15
+    timeout  = 10
+    retries  = 3
+  }
+}
+
+resource "hcloud_load_balancer_service" "registry_https" {
+  count            = var.registry_enabled ? 1 : 0
+  load_balancer_id = hcloud_load_balancer.registry[0].id
+  protocol         = "tcp"
+  listen_port      = 443
+  destination_port = var.ingress_https_node_port
+  health_check {
+    protocol = "tcp"
+    port     = var.ingress_https_node_port
+    interval = 15
+    timeout  = 10
+    retries  = 3
   }
 }
 
@@ -470,6 +545,11 @@ output "worker_ipv4s" {
 output "network_id" {
   description = "ID da rede privada (10.10.0.0/16) para uso por workloads que precisem ingressar nela"
   value       = hcloud_network.private.id
+}
+
+output "registry_load_balancer_ipv4" {
+  description = "Create the registry_domain A record with this address before applying platform/hetzner."
+  value       = var.registry_enabled ? hcloud_load_balancer.registry[0].ipv4 : null
 }
 
 output "kube_host" {

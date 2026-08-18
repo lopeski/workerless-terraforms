@@ -1,0 +1,8 @@
+mirrors:
+  "localhost:5001":
+    endpoint:
+      - "http://host.k3d.internal:5001"
+configs:
+  "host.k3d.internal:5001":
+    tls:
+      insecure_skip_verify: true

@@ -25,6 +25,28 @@ variable "prometheus_node_port" {
   default = 30090
 }
 
+variable "registry_enabled" {
+  type    = bool
+  default = true
+}
+
+variable "registry_node_port" {
+  type    = number
+  default = 30001
+}
+
+variable "registry_storage_class" {
+  type    = string
+  default = "local-path"
+}
+
+variable "registry_admin_password" {
+  description = "Development-only Harbor administrator password."
+  type        = string
+  sensitive   = true
+  default     = "workerless-local-harbor-admin"
+}
+
 variable "plans" {
   type = map(object({
     quota = map(string)
@@ -133,6 +155,38 @@ module "core_platform" {
   monitoring_storage = {
     storage_class_name = "local-path"
   }
+}
+
+resource "kubernetes_secret_v1" "harbor_admin" {
+  count = var.registry_enabled ? 1 : 0
+  metadata {
+    name      = "harbor-admin"
+    namespace = "harbor"
+  }
+  data       = { HARBOR_ADMIN_PASSWORD = var.registry_admin_password }
+  depends_on = [kubernetes_namespace_v1.harbor]
+}
+
+resource "kubernetes_namespace_v1" "harbor" {
+  count = var.registry_enabled ? 1 : 0
+  metadata { name = "harbor" }
+}
+
+module "harbor" {
+  source = "../../modules/harbor"
+
+  enabled           = var.registry_enabled
+  namespace         = "harbor"
+  create_namespace  = false
+  external_url      = "http://localhost:5001"
+  push_url          = "harbor-registry.harbor.svc:5000"
+  expose_type       = "nodePort"
+  node_port         = var.registry_node_port
+  storage_class     = var.registry_storage_class
+  trivy_enabled     = false
+  admin_secret_name = "harbor-admin"
+
+  depends_on = [kubernetes_secret_v1.harbor_admin]
 }
 
 # -------------------------------------------------------------------------
@@ -288,4 +342,20 @@ output "paas_sa_token_base64" {
 output "prometheus_url" {
   description = "URL do Prometheus via NodePort do k3d, alcançável do host — usar como OBSERVABILITY_PROMETHEUS_URL."
   value       = "http://localhost:${var.prometheus_node_port}"
+}
+
+output "registry_url" {
+  value = module.harbor.registry_url
+}
+
+output "registry_push_url" {
+  value = module.harbor.registry_push_url
+}
+
+output "registry_credentials_source_namespace" {
+  value = module.harbor.registry_credentials_source_namespace
+}
+
+output "registry_credentials_source_secret" {
+  value = module.harbor.registry_credentials_source_secret
 }

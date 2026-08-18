@@ -111,6 +111,52 @@ variable "prometheus_node_port" {
   default     = 30090
 }
 
+variable "registry_enabled" {
+  type    = bool
+  default = true
+}
+
+variable "registry_domain" {
+  description = "DNS name whose A record points at registry_load_balancer_ipv4 from envs/hetzner."
+  type        = string
+  default     = null
+  validation {
+    condition     = !var.registry_enabled || (var.registry_domain != null && length(trimspace(var.registry_domain)) > 0)
+    error_message = "registry_domain is required when registry_enabled is true."
+  }
+}
+
+variable "acme_email" {
+  type      = string
+  default   = null
+  sensitive = true
+  validation {
+    condition     = !var.registry_enabled || (var.acme_email != null && can(regex("^[^@]+@[^@]+$", var.acme_email)))
+    error_message = "A valid acme_email is required when registry_enabled is true."
+  }
+}
+
+variable "registry_storage_class" {
+  type    = string
+  default = "hcloud-volumes"
+}
+
+variable "registry_admin_secret_name" {
+  description = "Pre-existing Secret in the harbor namespace."
+  type        = string
+  default     = "harbor-admin"
+}
+
+variable "ingress_http_node_port" {
+  type    = number
+  default = 30080
+}
+
+variable "ingress_https_node_port" {
+  type    = number
+  default = 30443
+}
+
 locals {
   workload_event_source_egress_rules = flatten([
     for workload in values(var.workloads) : workload.event_source_egress_rules
@@ -183,6 +229,78 @@ resource "helm_release" "hcloud_csi" {
   atomic  = true
 }
 
+resource "kubernetes_namespace_v1" "harbor" {
+  count = var.registry_enabled ? 1 : 0
+  metadata { name = "harbor" }
+}
+
+resource "helm_release" "ingress_nginx" {
+  count            = var.registry_enabled ? 1 : 0
+  name             = "ingress-nginx"
+  repository       = "https://kubernetes.github.io/ingress-nginx"
+  chart            = "ingress-nginx"
+  version          = "4.11.3"
+  namespace        = "ingress-nginx"
+  create_namespace = true
+  values           = [yamlencode({ controller = { service = { type = "NodePort", nodePorts = { http = var.ingress_http_node_port, https = var.ingress_https_node_port } } } })]
+  wait             = true
+}
+
+resource "helm_release" "cert_manager" {
+  count            = var.registry_enabled ? 1 : 0
+  name             = "cert-manager"
+  repository       = "https://charts.jetstack.io"
+  chart            = "cert-manager"
+  version          = "v1.16.2"
+  namespace        = "cert-manager"
+  create_namespace = true
+  values           = [yamlencode({ crds = { enabled = true } })]
+  wait             = true
+}
+
+resource "kubectl_manifest" "letsencrypt" {
+  count      = var.registry_enabled ? 1 : 0
+  depends_on = [helm_release.cert_manager]
+  yaml_body = yamlencode({
+    apiVersion = "cert-manager.io/v1"
+    kind       = "ClusterIssuer"
+    metadata   = { name = "letsencrypt-production" }
+    spec = { acme = {
+      email               = var.acme_email
+      server              = "https://acme-v02.api.letsencrypt.org/directory"
+      privateKeySecretRef = { name = "letsencrypt-production-account" }
+      solvers             = [{ http01 = { ingress = { ingressClassName = "nginx" } } }]
+    } }
+  })
+}
+
+module "harbor" {
+  source = "../../modules/harbor"
+
+  enabled          = var.registry_enabled
+  namespace        = "harbor"
+  create_namespace = false
+  external_url     = var.registry_enabled ? "https://${var.registry_domain}" : "http://disabled.invalid"
+  push_url         = "harbor-registry.harbor.svc:5000"
+  expose_type      = "ingress"
+  ingress_host     = var.registry_domain
+  ingress_annotations = {
+    "cert-manager.io/cluster-issuer"              = "letsencrypt-production"
+    "nginx.ingress.kubernetes.io/proxy-body-size" = "0"
+  }
+  tls_secret_name   = "harbor-registry-tls"
+  storage_class     = var.registry_storage_class
+  trivy_enabled     = true
+  admin_secret_name = var.registry_admin_secret_name
+
+  depends_on = [
+    kubernetes_namespace_v1.harbor,
+    helm_release.hcloud_csi,
+    helm_release.ingress_nginx,
+    kubectl_manifest.letsencrypt,
+  ]
+}
+
 module "core_platform" {
   source     = "../../modules/core-platform"
   depends_on = [helm_release.hcloud_csi]
@@ -245,3 +363,8 @@ output "prometheus_url" {
   description = "URL do Prometheus via NodePort, alcançável apenas a partir de control_plane_cidrs (firewall em envs/hetzner) — usar como OBSERVABILITY_PROMETHEUS_URL."
   value       = "http://${data.terraform_remote_state.hetzner_env.outputs.server_ipv4s[0]}:${var.prometheus_node_port}"
 }
+
+output "registry_url" { value = module.harbor.registry_url }
+output "registry_push_url" { value = module.harbor.registry_push_url }
+output "registry_credentials_source_namespace" { value = module.harbor.registry_credentials_source_namespace }
+output "registry_credentials_source_secret" { value = module.harbor.registry_credentials_source_secret }

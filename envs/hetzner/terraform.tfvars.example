@@ -18,6 +18,12 @@ control_plane_cidrs = [
 # Must match platform/hetzner's prometheus_node_port.
 prometheus_node_port = 30090
 
+# Provisions the public 80/443 load balancer. After apply, point the registry
+# DNS A record to output registry_load_balancer_ipv4 before platform/hetzner.
+registry_enabled        = true
+ingress_http_node_port  = 30080
+ingress_https_node_port = 30443
+
 server_type        = "cax11"
 worker_count       = 2
 worker_server_type = "cax21"

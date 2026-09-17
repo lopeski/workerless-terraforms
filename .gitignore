@@ -15,6 +15,8 @@ _legacy/
 
 # Planos
 tfplan
+tfdestroyplan
 
 # Credenciais locais geradas — nunca commitar
 local-cluster-credentials.md
+platform/local/workerless-api.local.env

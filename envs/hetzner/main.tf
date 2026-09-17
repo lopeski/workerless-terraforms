@@ -253,6 +253,13 @@ resource "hcloud_server" "bootstrap" {
     #!/bin/bash
     set -euxo pipefail
     until ip -4 addr show enp7s0 2>/dev/null | grep -q "${local.bootstrap_priv_ip}"; do sleep 2; done
+    mkdir -p /etc/rancher/k3s
+    cat >/etc/rancher/k3s/registries.yaml <<'REGISTRIES'
+    mirrors:
+      "10.43.100.100:5000":
+        endpoint:
+          - "http://10.43.100.100:5000"
+    REGISTRIES
     PUBLIC_IP=$(curl -s ifconfig.me)
     curl -sfL https://get.k3s.io | \
       INSTALL_K3S_VERSION=${var.k3s_version} \
@@ -316,6 +323,13 @@ resource "hcloud_server" "joiners" {
     #!/bin/bash
     set -euxo pipefail
     until ip -4 addr show enp7s0 2>/dev/null | grep -q "${each.value}"; do sleep 2; done
+    mkdir -p /etc/rancher/k3s
+    cat >/etc/rancher/k3s/registries.yaml <<'REGISTRIES'
+    mirrors:
+      "10.43.100.100:5000":
+        endpoint:
+          - "http://10.43.100.100:5000"
+    REGISTRIES
     PUBLIC_IP=$(curl -s ifconfig.me)
     curl -sfL https://get.k3s.io | \
       INSTALL_K3S_VERSION=${var.k3s_version} \
@@ -357,6 +371,13 @@ resource "hcloud_server" "workers" {
     #!/bin/bash
     set -euxo pipefail
     until ip -4 addr show enp7s0 2>/dev/null | grep -q "${each.value}"; do sleep 2; done
+    mkdir -p /etc/rancher/k3s
+    cat >/etc/rancher/k3s/registries.yaml <<'REGISTRIES'
+    mirrors:
+      "10.43.100.100:5000":
+        endpoint:
+          - "http://10.43.100.100:5000"
+    REGISTRIES
     curl -sfL https://get.k3s.io | \
       INSTALL_K3S_VERSION=${var.k3s_version} \
       K3S_TOKEN='${random_password.k3s_token.result}' \

@@ -14,7 +14,8 @@ variable "prometheus_node_port" {
 
 resource "null_resource" "k3d_cluster" {
   triggers = {
-    command = "k3d cluster create local-rock --api-port 6550 --servers 1 --agents 1 --port \"${var.prometheus_node_port}:${var.prometheus_node_port}@server:0\" --wait"
+    command                = "k3d cluster create local-rock --api-port 6550 --servers 1 --agents 1 --registry-config \"${path.module}/registries.yaml\" --port \"${var.prometheus_node_port}:${var.prometheus_node_port}@server:0\" --wait"
+    registries_yaml_sha256 = filesha256("${path.module}/registries.yaml")
   }
 
   provisioner "local-exec" {

@@ -1,0 +1,7 @@
+mirrors:
+  "10.43.100.100:5000":
+    endpoint:
+      - "http://10.43.100.100:5000"
+  "host.docker.internal:5001":
+    endpoint:
+      - "http://host.docker.internal:5001"

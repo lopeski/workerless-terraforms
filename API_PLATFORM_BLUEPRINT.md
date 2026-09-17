@@ -6,6 +6,8 @@ Este documento descreve o que o projeto `workerless-terraforms` provisiona em am
 
 O produto-alvo é uma PaaS para workloads consumidores orientados a eventos. O usuário informa uma imagem de container, credenciais/configuração do broker e regras de autoscaling; a plataforma cria o ambiente Kubernetes necessário com segurança, observabilidade e escala automática via KEDA.
 
+Este não é um produto para hospedar APIs REST tradicionais de cliente. Workloads de tenant são consumidores/background workers; health checks e métricas HTTP são internos e não implicam `Service`, `Ingress` ou roteamento público.
+
 ## Visão de produto
 
 O usuário final não deve operar Terraform nem Kubernetes diretamente. A experiência desejada é:
@@ -104,7 +106,7 @@ Ordem:
 
 ### Infra local
 
-`envs/local` cria apenas o cluster k3d. Não cria broker, banco, registry nem serviços externos. RabbitMQ, Kafka, Pub/Sub emulador, Postgres ou qualquer dependência do workload devem rodar fora desse Terraform.
+`envs/local` cria apenas o cluster k3d, já configurado para tratar `10.43.100.100:5000` como registry HTTP interno. Não cria broker, banco nem serviços externos. RabbitMQ, Kafka, Pub/Sub emulador, Postgres ou qualquer dependência do workload devem rodar fora desse Terraform. O contrato Terraform atual aceita RabbitMQ como scaler v1; outros brokers ficam para a API/control-plane.
 
 ### Plataforma local
 
@@ -118,6 +120,7 @@ Ele instala `modules/core-platform` com:
 - `cluster_pod_cidr = "10.42.0.0/16"`
 - `cluster_service_cidr = "10.43.0.0/16"`
 - storage de monitoring em `local-path`
+- storage do registry interno em `local-path`
 - regras de egress agregadas dos workloads declarados
 
 Também cria um backend local de secrets para desenvolvimento:
@@ -128,7 +131,7 @@ Também cria um backend local de secrets para desenvolvimento:
 - `ClusterSecretStore` chamado `dev-secrets`
 - Secrets dummy por workload em `dev-secrets`
 
-Esse desenho permite que workloads consumam credenciais sempre via External Secrets Operator, mesmo em dev. Em local, o store lê Secrets nativos do namespace `dev-secrets`; em produção, o store deve apontar para Vault, AWS Secrets Manager, GCP Secret Manager ou outro backend real.
+Esse desenho permite que workloads consumam credenciais sempre via External Secrets Operator, mesmo em dev. Em local, o store lê Secrets nativos do namespace `dev-secrets`; em produção, o store deve apontar para Vault, AWS Secrets Manager, GCP Secret Manager ou outro backend real. A chave backend é gerada pela plataforma no formato DNS-safe `<tenant>-<app>-credentials`.
 
 ### Workloads locais atuais
 
@@ -139,11 +142,12 @@ Os workloads são declarados em `platform/local/terraform.tfvars`. O exemplo cri
 - tenant `dev`
 - imagem `registry.k8s.io/pause:3.9`
 - `min_replicas = 1`
-- trigger KEDA `cron`
-- secret `placeholder-consumer-credentials`
+- trigger KEDA RabbitMQ usado como cenário de aceite local
+- Secret backend `dev-placeholder-consumer-credentials`
+- Secret materializado `placeholder-consumer-credentials`
 - SecretStore `dev-secrets`
 
-Esse workload placeholder valida o caminho completo sem depender de broker externo.
+Esse workload placeholder valida os manifestos, mas só fica saudável quando o Secret dev aponta para um RabbitMQ acessível pelo cluster.
 
 ## O que roda em cloud
 
@@ -198,7 +202,7 @@ Defaults atuais:
 - `modules/core-platform`
 - `modules/workload` para os workloads declarados
 
-O Hetzner CSI Driver usa um Secret `hcloud` no namespace `kube-system` e instala o chart `hcloud-csi`. A storage class usada pelo monitoring é:
+O Hetzner CSI Driver usa um Secret `hcloud` no namespace `kube-system` e instala o chart `hcloud-csi`. A storage class usada pelo monitoring e pelo registry interno é:
 
 ```text
 hcloud-volumes
@@ -230,6 +234,7 @@ Cria namespaces explícitos:
 
 | Namespace | Pod Security |
 | --- | --- |
+| `build-system` | `baseline` |
 | `external-secrets` | `baseline` |
 | `keda` | `baseline` |
 | `monitoring` | `privileged` |
@@ -249,7 +254,7 @@ Instala o chart `keda` versão `2.19.0`, com:
 - replicas e PodDisruptionBudgets para maior disponibilidade
 - NetworkPolicy default-deny e allowlist
 
-KEDA é o mecanismo central de autoscaling. A API deve gerar `ScaledObject` e, quando necessário, `TriggerAuthentication` ou `ClusterTriggerAuthentication`.
+KEDA é o mecanismo central de autoscaling. A API deve gerar `ScaledObject` e `TriggerAuthentication` namespaced. `ClusterTriggerAuthentication` não deve ser aceito para workloads de tenant.
 
 ### CoreDNS
 
@@ -271,6 +276,25 @@ Instala Kyverno e aplica uma `ClusterPolicy` PSS baseline. A policy valida Pods 
 - `monitoring`
 
 Workloads de tenant devem ser compatíveis com PSS baseline.
+
+### Internal registry
+
+Cria um Docker Registry `registry:2` no namespace `build-system` para o fluxo
+ZIP/Kaniko in-cluster:
+
+- Deployment de 1 réplica
+- Service `ClusterIP` fixo `10.43.100.100:5000`
+- PVC persistente
+- sem autenticação neste primeiro corte
+- sem NodePort, Ingress ou firewall público
+- NetworkPolicy permitindo ingress no registry a partir de `build-system` e dos
+  nós via `node_private_cidr`
+
+As imagens internas devem usar o formato:
+
+```text
+10.43.100.100:5000/workerless/<tenant>/<app>:sha-<hash>
+```
 
 ### Monitoring
 
@@ -300,13 +324,14 @@ Para cada workload, o módulo cria:
 2. ServiceAccount `{app_id}`
 3. LimitRange `worker-limits`
 4. ResourceQuota `worker-quota`
-5. ExternalSecret `{external_secret_ref.name}`
+5. ExternalSecret `{app_id}-credentials`
 6. NetworkPolicy `default-deny-all`
 7. NetworkPolicy `worker-egress-allow`
-8. NetworkPolicy `worker-allow-monitoring-scrape`
+8. NetworkPolicy `worker-allow-monitoring-scrape` quando métricas estão habilitadas
 9. Deployment `{app_id}`
-10. KEDA authentication manifests opcionais
+10. TriggerAuthentication `{app_id}-keda-auth` quando algum trigger usa secret
 11. KEDA ScaledObject `{app_id}-scaledobject`
+12. PodMonitor `{app_id}-metrics` quando métricas estão habilitadas
 
 ### Labels padrão
 
@@ -363,18 +388,25 @@ O `ScaledObject` aponta para o Deployment do worker:
 ```yaml
 scaleTargetRef:
   name: <app_id>
+pollingInterval: <keda_polling_interval>
+cooldownPeriod: <keda_cooldown_period>
 minReplicaCount: <min_replicas>
 maxReplicaCount: <plan.max_replicas>
-triggers: <keda_triggers>
+triggers:
+  - type: rabbitmq
+    metadata:
+      queueName: <keda_triggers[0].metadata.queueName>
+      mode: <keda_triggers[0].metadata.mode>
+      value: "<keda_triggers[0].metadata.value>"
+    authenticationRef:
+      name: <app_id>-keda-auth
 ```
 
-Os triggers são passados como estrutura KEDA nativa. Exemplos esperados:
+O módulo Terraform recebe descritores de trigger KEDA, não manifests CRD livres. RabbitMQ é o caso de aceite, mas o campo `type` não fica travado nele. O módulo gera internamente:
 
-- RabbitMQ queue length
-- Kafka consumer lag
-- Google Pub/Sub subscription size
-- cron para testes
-- qualquer scaler suportado pelo KEDA
+- metadata do trigger KEDA como `map(string)`
+- `authenticationRef` para `TriggerAuthentication` namespaced
+- `secretTargetRef` apontando somente para o Secret canônico do próprio workload
 
 ## Contrato de dados para a API
 
@@ -542,7 +574,7 @@ Esses endpoints devem ser desabilitados ou protegidos em produção.
 6. Validar limite de 63 caracteres do namespace.
 7. Validar imagem de container.
 8. Validar `externalSecretRef`.
-9. Validar triggers KEDA.
+9. Validar descritores KEDA e usar RabbitMQ como cenário de aceite.
 10. Validar CIDRs e portas de egress.
 11. Inserir workload no DB com `status = "pending"`.
 12. Em local, criar/atualizar Secret em `dev-secrets`, se a request trouxer credenciais dev.
@@ -555,8 +587,9 @@ Esses endpoints devem ser desabilitados ou protegidos em produção.
     - ExternalSecret
     - NetworkPolicies
     - Deployment
-    - TriggerAuthentication/ClusterTriggerAuthentication
+    - TriggerAuthentication
     - ScaledObject
+    - PodMonitor quando métricas estiverem habilitadas
 15. Consultar readiness mínima.
 16. Atualizar DB para `status = "active"`.
 17. Retornar workload com namespace, status e links de status/métricas/logs.
@@ -762,7 +795,7 @@ Recomendação de teste no repo da API:
 1. Criar fixtures de workload.
 2. Gerar manifestos pelo `WorkloadSynthesizer`.
 3. Comparar com snapshots esperados derivados de `modules/workload`.
-4. Cobrir RabbitMQ, Kafka, Pub/Sub e cron.
+4. Cobrir RabbitMQ no teste de aceite e fixtures adicionais para Kafka, Pub/Sub e cron.
 
 Campos que precisam permanecer compatíveis:
 
@@ -940,7 +973,7 @@ Em local, a API pode rodar fora do cluster para acelerar desenvolvimento. Em clo
 - Modelo final de billing/plans.
 - Estratégia de isolamento por tenant além de namespace.
 - Política para egress privado em workloads que precisem acessar redes internas.
-- Se `TriggerAuthentication` será sempre namespaced ou se `ClusterTriggerAuthentication` será permitido para todos.
+- Como expandir o contrato tipado para Kafka, Pub/Sub e outros scalers sem aceitar YAML livre de cliente.
 
 ## Resumo executivo
 

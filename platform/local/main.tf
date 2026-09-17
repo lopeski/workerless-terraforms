@@ -25,6 +25,12 @@ variable "prometheus_node_port" {
   default = 30090
 }
 
+variable "workerless_api_server_url" {
+  description = "URL do API server k3d alcancavel pela API executada no host."
+  type        = string
+  default     = "https://127.0.0.1:6550"
+}
+
 variable "plans" {
   type = map(object({
     quota = map(string)
@@ -54,12 +60,20 @@ variable "workloads" {
     plan_key     = string
     worker_image = string
     external_secret_ref = object({
-      name              = string
       secret_store_name = string
       secret_store_kind = string
     })
-    keda_triggers                 = list(any)
-    keda_authentication_manifests = optional(list(any), [])
+    keda_polling_interval = optional(number, 30)
+    keda_cooldown_period  = optional(number, 60)
+    keda_triggers = list(object({
+      type        = string
+      metadata    = map(string)
+      metric_type = optional(string)
+      authentication_secret_refs = optional(list(object({
+        parameter = string
+        key       = string
+      })), [])
+    }))
     event_source_egress_rules = optional(list(object({
       cidr = string
       ports = list(object({
@@ -67,7 +81,39 @@ variable "workloads" {
         protocol = optional(string, "TCP")
       }))
     })), [])
-    min_replicas = optional(number, 0)
+    min_replicas                     = optional(number, 0)
+    image_pull_secret_refs           = optional(list(string), [])
+    termination_grace_period_seconds = optional(number, 30)
+    probes = optional(object({
+      readiness = optional(object({
+        http_get = object({
+          path   = string
+          port   = string
+          scheme = optional(string, "HTTP")
+        })
+        initial_delay_seconds = optional(number, 5)
+        period_seconds        = optional(number, 10)
+        timeout_seconds       = optional(number, 1)
+        failure_threshold     = optional(number, 3)
+      }))
+      liveness = optional(object({
+        http_get = object({
+          path   = string
+          port   = string
+          scheme = optional(string, "HTTP")
+        })
+        initial_delay_seconds = optional(number, 15)
+        period_seconds        = optional(number, 20)
+        timeout_seconds       = optional(number, 1)
+        failure_threshold     = optional(number, 3)
+      }))
+    }), {})
+    metrics = optional(object({
+      enabled   = optional(bool, false)
+      port_name = optional(string, "metrics")
+      port      = optional(number, 9090)
+      path      = optional(string, "/metrics")
+    }), {})
   }))
   description = "Tenant workloads keyed by DNS-label application id."
 
@@ -91,12 +137,22 @@ variable "workloads" {
     ])
     error_message = "Each generated namespace name wl-tenant-app must be 63 characters or fewer."
   }
+
+  validation {
+    condition = alltrue([
+      for workload in values(var.workloads) : length(workload.keda_triggers) > 0
+    ])
+    error_message = "Each workload must declare at least one KEDA trigger."
+  }
 }
 
 locals {
   workload_event_source_egress_rules = flatten([
     for workload in values(var.workloads) : workload.event_source_egress_rules
   ])
+  workload_credentials_backend_keys = {
+    for app_id, workload in var.workloads : app_id => "${workload.tenant_id}-${app_id}-credentials"
+  }
 }
 
 provider "helm" {
@@ -119,6 +175,8 @@ provider "kubernetes" {
 module "core_platform" {
   source = "../../modules/core-platform"
 
+  create_workerless_api_static_token = true
+
   cluster_pod_cidr          = "10.42.0.0/16"
   cluster_service_cidr      = "10.43.0.0/16"
   event_source_egress_rules = local.workload_event_source_egress_rules
@@ -129,8 +187,14 @@ module "core_platform" {
   prometheus_node_port = var.prometheus_node_port
   node_private_cidr    = "0.0.0.0/0"
 
+  # Pulls do registry interno chegam ao pod a partir da bridge Docker do k3d.
+  registry_node_private_cidr = "172.16.0.0/12"
+
   # k3d traz o local-path-provisioner nativamente; suficiente para dev.
   monitoring_storage = {
+    storage_class_name = "local-path"
+  }
+  registry_storage = {
     storage_class_name = "local-path"
   }
 }
@@ -201,12 +265,12 @@ resource "kubernetes_secret_v1" "dev_workload_credentials" {
   for_each = var.workloads
 
   metadata {
-    name      = each.value.external_secret_ref.name
+    name      = local.workload_credentials_backend_keys[each.key]
     namespace = kubernetes_namespace_v1.dev_secrets.metadata[0].name
   }
 
   data = {
-    EXAMPLE_VAR = "dev"
+    RABBITMQ_CONNECTION_STRING = "amqp://guest:guest@rabbitmq.default.svc.cluster.local:5672/"
   }
 }
 
@@ -261,31 +325,63 @@ module "workload" {
     kubernetes_secret_v1.dev_workload_credentials,
   ]
 
-  app_id                        = each.key
-  tenant_id                     = each.value.tenant_id
-  plan_key                      = each.value.plan_key
-  plan                          = var.plans[each.value.plan_key]
-  worker_image                  = each.value.worker_image
-  external_secret_ref           = each.value.external_secret_ref
-  event_source_egress_rules     = each.value.event_source_egress_rules
-  min_replicas                  = each.value.min_replicas
-  keda_authentication_manifests = each.value.keda_authentication_manifests
-  keda_triggers                 = each.value.keda_triggers
+  app_id                           = each.key
+  tenant_id                        = each.value.tenant_id
+  plan_key                         = each.value.plan_key
+  plan                             = var.plans[each.value.plan_key]
+  worker_image                     = each.value.worker_image
+  external_secret_ref              = each.value.external_secret_ref
+  event_source_egress_rules        = each.value.event_source_egress_rules
+  min_replicas                     = each.value.min_replicas
+  keda_polling_interval            = each.value.keda_polling_interval
+  keda_cooldown_period             = each.value.keda_cooldown_period
+  keda_triggers                    = each.value.keda_triggers
+  image_pull_secret_refs           = each.value.image_pull_secret_refs
+  termination_grace_period_seconds = each.value.termination_grace_period_seconds
+  probes                           = each.value.probes
+  metrics                          = each.value.metrics
 }
 
 output "paas_sa_token" {
-  description = "Token JWT da ServiceAccount"
+  description = "DEPRECATED: use workerless_api_token."
   value       = module.core_platform.paas_sa_token
   sensitive   = true
 }
 
 output "paas_sa_token_base64" {
-  description = "Token JWT da ServiceAccount codificado em Base64"
+  description = "DEPRECATED: use workerless_api_token (a API espera o JWT sem Base64)."
   value       = module.core_platform.paas_sa_token_base64
   sensitive   = true
+}
+
+output "workerless_api_token" {
+  description = "Token local persistente da identidade RBAC limitada workerless-api-runtime."
+  value       = module.core_platform.workerless_api_token
+  sensitive   = true
+}
+
+output "workerless_api_ca_base64" {
+  description = "CA do cluster local em Base64."
+  value       = module.core_platform.workerless_api_ca_base64
+  sensitive   = true
+}
+
+output "workerless_api_server_url" {
+  description = "URL do Kubernetes API server para a API local."
+  value       = var.workerless_api_server_url
 }
 
 output "prometheus_url" {
   description = "URL do Prometheus via NodePort do k3d, alcançável do host — usar como OBSERVABILITY_PROMETHEUS_URL."
   value       = "http://localhost:${var.prometheus_node_port}"
+}
+
+output "registry_internal_endpoint" {
+  description = "Endpoint interno host:porta do registry privado do cluster."
+  value       = module.core_platform.registry_internal_endpoint
+}
+
+output "registry_internal_url" {
+  description = "URL HTTP interna do registry privado do cluster."
+  value       = module.core_platform.registry_internal_url
 }

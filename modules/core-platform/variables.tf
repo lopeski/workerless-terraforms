@@ -8,6 +8,26 @@ variable "cluster_service_cidr" {
   default = "10.43.0.0/16"
 }
 
+variable "registry_service_ip" {
+  description = "ClusterIP fixo do registry interno usado pelo fluxo build-system/Kaniko."
+  type        = string
+  default     = "10.43.100.100"
+}
+
+variable "registry_port" {
+  description = "Porta TCP do registry interno."
+  type        = number
+  default     = 5000
+}
+
+variable "registry_storage" {
+  description = "Configuração do PVC persistente do registry interno."
+  type = object({
+    storage_class_name = string
+    size               = optional(string, "20Gi")
+  })
+}
+
 variable "event_source_egress_rules" {
   type = list(object({
     cidr = string
@@ -46,9 +66,32 @@ variable "prometheus_node_port" {
 }
 
 variable "node_private_cidr" {
-  description = "CIDR da rede privada dos nós (ex.: 10.10.1.0/24 na Hetzner). Necessário apenas quando prometheus_node_port != null, para liberar na NetworkPolicy o tráfego já SNATed pelo NodePort."
+  description = "CIDR da rede privada dos nós (ex.: 10.10.1.0/24 na Hetzner). Usado para liberar tráfego já SNATed pelo NodePort do Prometheus e pulls dos nós para o registry interno."
   type        = string
   default     = null
+}
+
+variable "registry_node_private_cidr" {
+  description = "CIDR de origem dos nós para pulls contra o registry interno. Quando null, usa node_private_cidr."
+  type        = string
+  default     = null
+}
+
+variable "create_workerless_api_static_token" {
+  description = "Cria um token persistente para a API. Deve ser true somente em clusters locais descartaveis; producao deve usar TokenRequest."
+  type        = bool
+  default     = false
+}
+
+variable "workerless_policy_failure_action" {
+  description = "Modo inicial das policies Workerless no Kyverno. Use Audit durante a migracao e Enforce depois do backfill."
+  type        = string
+  default     = "Audit"
+
+  validation {
+    condition     = contains(["Audit", "Enforce"], var.workerless_policy_failure_action)
+    error_message = "workerless_policy_failure_action must be Audit or Enforce."
+  }
 }
 
 # Persistência do kube-prometheus-stack. storage_class_name é obrigatório:

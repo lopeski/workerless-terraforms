@@ -38,12 +38,20 @@ variable "workloads" {
     plan_key     = string
     worker_image = string
     external_secret_ref = object({
-      name              = string
       secret_store_name = string
       secret_store_kind = string
     })
-    keda_triggers                 = list(any)
-    keda_authentication_manifests = optional(list(any), [])
+    keda_polling_interval = optional(number, 30)
+    keda_cooldown_period  = optional(number, 60)
+    keda_triggers = list(object({
+      type        = string
+      metadata    = map(string)
+      metric_type = optional(string)
+      authentication_secret_refs = optional(list(object({
+        parameter = string
+        key       = string
+      })), [])
+    }))
     event_source_egress_rules = optional(list(object({
       cidr = string
       ports = list(object({
@@ -51,7 +59,39 @@ variable "workloads" {
         protocol = optional(string, "TCP")
       }))
     })), [])
-    min_replicas = optional(number, 0)
+    min_replicas                     = optional(number, 0)
+    image_pull_secret_refs           = optional(list(string), [])
+    termination_grace_period_seconds = optional(number, 30)
+    probes = optional(object({
+      readiness = optional(object({
+        http_get = object({
+          path   = string
+          port   = string
+          scheme = optional(string, "HTTP")
+        })
+        initial_delay_seconds = optional(number, 5)
+        period_seconds        = optional(number, 10)
+        timeout_seconds       = optional(number, 1)
+        failure_threshold     = optional(number, 3)
+      }))
+      liveness = optional(object({
+        http_get = object({
+          path   = string
+          port   = string
+          scheme = optional(string, "HTTP")
+        })
+        initial_delay_seconds = optional(number, 15)
+        period_seconds        = optional(number, 20)
+        timeout_seconds       = optional(number, 1)
+        failure_threshold     = optional(number, 3)
+      }))
+    }), {})
+    metrics = optional(object({
+      enabled   = optional(bool, false)
+      port_name = optional(string, "metrics")
+      port      = optional(number, 9090)
+      path      = optional(string, "/metrics")
+    }), {})
   }))
   description = "Tenant workloads keyed by DNS-label application id."
 
@@ -74,6 +114,13 @@ variable "workloads" {
       for app_id, workload in var.workloads : length("wl-${workload.tenant_id}-${app_id}") <= 63
     ])
     error_message = "Each generated namespace name wl-tenant-app must be 63 characters or fewer."
+  }
+
+  validation {
+    condition = alltrue([
+      for workload in values(var.workloads) : length(workload.keda_triggers) > 0
+    ])
+    error_message = "Each workload must declare at least one KEDA trigger."
   }
 }
 
@@ -197,6 +244,9 @@ module "core_platform" {
   monitoring_storage = {
     storage_class_name = "hcloud-volumes"
   }
+  registry_storage = {
+    storage_class_name = "hcloud-volumes"
+  }
 }
 
 module "workload" {
@@ -205,43 +255,35 @@ module "workload" {
   source     = "../../modules/workload"
   depends_on = [module.core_platform]
 
-  app_id                        = each.key
-  tenant_id                     = each.value.tenant_id
-  plan_key                      = each.value.plan_key
-  plan                          = var.plans[each.value.plan_key]
-  worker_image                  = each.value.worker_image
-  external_secret_ref           = each.value.external_secret_ref
-  event_source_egress_rules     = each.value.event_source_egress_rules
-  min_replicas                  = each.value.min_replicas
-  keda_authentication_manifests = each.value.keda_authentication_manifests
-  keda_triggers                 = each.value.keda_triggers
-  node_selector                 = { "workerless.io/node-pool" = "workers" }
-}
-
-output "paas_sa_token" {
-  description = "Token JWT da ServiceAccount"
-  value       = module.core_platform.paas_sa_token
-  sensitive   = true
-}
-
-output "paas_sa_token_base64" {
-  description = "Token JWT da ServiceAccount codificado em Base64"
-  value       = module.core_platform.paas_sa_token_base64
-  sensitive   = true
-}
-
-output "paas_cluster_ca_base64" {
-  description = "CA do Cluster em Base64 (repassado do state do Hetzner)"
-  value       = data.terraform_remote_state.hetzner_env.outputs.kube_ca
-  sensitive   = true
-}
-
-output "kube_host" {
-  description = "URL do Kubernetes API server (repassado do state do Hetzner) — usar como KUBERNETES_SERVER_URL no control-plane externo (ex.: workerless-api)."
-  value       = data.terraform_remote_state.hetzner_env.outputs.kube_host
+  app_id                           = each.key
+  tenant_id                        = each.value.tenant_id
+  plan_key                         = each.value.plan_key
+  plan                             = var.plans[each.value.plan_key]
+  worker_image                     = each.value.worker_image
+  external_secret_ref              = each.value.external_secret_ref
+  event_source_egress_rules        = each.value.event_source_egress_rules
+  min_replicas                     = each.value.min_replicas
+  keda_polling_interval            = each.value.keda_polling_interval
+  keda_cooldown_period             = each.value.keda_cooldown_period
+  keda_triggers                    = each.value.keda_triggers
+  image_pull_secret_refs           = each.value.image_pull_secret_refs
+  termination_grace_period_seconds = each.value.termination_grace_period_seconds
+  probes                           = each.value.probes
+  metrics                          = each.value.metrics
+  node_selector                    = { "workerless.io/node-pool" = "workers" }
 }
 
 output "prometheus_url" {
   description = "URL do Prometheus via NodePort, alcançável apenas a partir de control_plane_cidrs (firewall em envs/hetzner) — usar como OBSERVABILITY_PROMETHEUS_URL."
   value       = "http://${data.terraform_remote_state.hetzner_env.outputs.server_ipv4s[0]}:${var.prometheus_node_port}"
+}
+
+output "registry_internal_endpoint" {
+  description = "Endpoint interno host:porta do registry privado do cluster."
+  value       = module.core_platform.registry_internal_endpoint
+}
+
+output "registry_internal_url" {
+  description = "URL HTTP interna do registry privado do cluster."
+  value       = module.core_platform.registry_internal_url
 }

@@ -63,10 +63,9 @@ workloads = {
     worker_image = "ghcr.io/acme/orders-consumer:1.2.3"
 
     # External Secrets extracts all key/value pairs from backend key
-    # "orders-consumer-credentials" and creates a Kubernetes Secret with
-    # the same name in the workload namespace.
+    # "acme-orders-consumer-credentials" and creates
+    # "orders-consumer-credentials" in the workload namespace.
     external_secret_ref = {
-      name              = "orders-consumer-credentials"
       secret_store_name = "tenant-secrets"
       secret_store_kind = "ClusterSecretStore"
     }
@@ -81,11 +80,14 @@ workloads = {
     keda_triggers = [{
       type = "rabbitmq"
       metadata = {
-        queueName   = "acme-orders"
-        mode        = "QueueLength"
-        value       = "5"
-        hostFromEnv = "RABBITMQ_CONNECTION_STRING"
+        queueName = "acme-orders"
+        mode      = "QueueLength"
+        value     = "5"
       }
+      authentication_secret_refs = [{
+        parameter = "host"
+        key       = "RABBITMQ_CONNECTION_STRING"
+      }]
     }]
   }
 
@@ -96,26 +98,55 @@ workloads = {
     min_replicas = 1
 
     external_secret_ref = {
-      name              = "billing-consumer-credentials"
       secret_store_name = "tenant-secrets"
       secret_store_kind = "ClusterSecretStore"
     }
 
     event_source_egress_rules = [{
-      cidr = "198.51.100.0/24"
+      cidr = "198.51.100.20/32"
       ports = [
-        { port = 9093 },
+        { port = 5671 },
       ]
     }]
 
-    keda_triggers = [{
-      type = "kafka"
-      metadata = {
-        bootstrapServers = "broker-1.example.com:9093,broker-2.example.com:9093"
-        consumerGroup    = "globex-billing"
-        topic            = "billing-events"
-        lagThreshold     = "10"
+    image_pull_secret_refs = ["globex-registry"]
+
+    metrics = {
+      enabled   = true
+      port_name = "metrics"
+      port      = 9090
+      path      = "/metrics"
+    }
+
+    probes = {
+      readiness = {
+        http_get = {
+          path = "/ready"
+          port = "metrics"
+        }
       }
+      liveness = {
+        http_get = {
+          path = "/health"
+          port = "metrics"
+        }
+      }
+    }
+
+    keda_polling_interval = 30
+    keda_cooldown_period  = 60
+    keda_triggers = [{
+      type = "rabbitmq"
+      metadata = {
+        queueName = "globex-billing"
+        mode      = "QueueLength"
+        value     = "10"
+        protocol  = "amqp"
+      }
+      authentication_secret_refs = [{
+        parameter = "host"
+        key       = "RABBITMQ_CONNECTION_STRING"
+      }]
     }]
   }
 }

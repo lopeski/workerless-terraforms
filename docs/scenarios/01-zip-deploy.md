@@ -25,7 +25,7 @@ Kaniko Job (in-cluster, sem docker daemon, PSS-baseline compliant)
    │
    │ 3. docker build → docker push
    ▼
-Container Registry (ghcr.io / Docker Hub)
+Internal Registry (10.43.100.100:5000)
    │
    │ 4. image tag (SHA) retornado ao polling da API
    ▼
@@ -45,10 +45,12 @@ Kubernetes
 ## Pré-requisitos específicos
 
 - [00-prerequisites.md](./00-prerequisites.md) completo.
-- Cluster com namespace `build-system` e RBAC para Kaniko Jobs criados.
-  (Parte da Fase 3 da API — adicionar a `modules/core-platform` como `CreateBuildSystemCommand`.)
-- Registry acessível pelo cluster com credenciais como Secret `registry-credentials`
-  no namespace `build-system`.
+- Cluster com namespace `build-system` criado pelo `modules/core-platform`.
+- Registry interno criado pelo `modules/core-platform`, acessível apenas dentro do
+  cluster em `10.43.100.100:5000`.
+- Neste primeiro corte o registry não tem autenticação, NodePort ou Ingress. O
+  Kaniko Job deve fazer push usando HTTP interno, por exemplo com
+  `--insecure-registry 10.43.100.100:5000`.
 - Seu projeto deve conter um `Dockerfile` na raiz do ZIP.
 
 Estrutura mínima do ZIP:
@@ -90,12 +92,13 @@ zip -r meu-consumer.zip . -x "*.git*" -x "node_modules/*" -x ".env"
 ```bash
 TENANT_ID="clxxxx"       # id obtido em 00-prerequisites.md
 APP_ID="meu-consumer"    # DNS label: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+REGISTRY="10.43.100.100:5000/workerless/${TENANT_ID}/${APP_ID}"
 
 curl -s -X POST \
   "http://localhost:3000/tenants/${TENANT_ID}/workloads/${APP_ID}/build" \
   -H "X-Admin-Key: troca-isso-em-producao" \
   -F "source=@meu-consumer.zip" \
-  -F "registry=ghcr.io/minha-org/meu-consumer" | jq .
+  -F "registry=${REGISTRY}" | jq .
 ```
 
 Resposta:
@@ -122,7 +125,7 @@ Quando `status` for `success`, o campo `imageTag` conterá a referência complet
 ```json
 {
   "status": "success",
-  "imageTag": "ghcr.io/minha-org/meu-consumer:sha-a1b2c3d",
+  "imageTag": "10.43.100.100:5000/workerless/clxxxx/meu-consumer:sha-a1b2c3d",
   "finishedAt": "2026-01-01T00:05:00.000Z"
 }
 ```
@@ -130,7 +133,7 @@ Quando `status` for `success`, o campo `imageTag` conterá a referência complet
 ### Passo 4 — Criar o workload
 
 ```bash
-IMAGE_TAG="ghcr.io/minha-org/meu-consumer:sha-a1b2c3d"
+IMAGE_TAG="10.43.100.100:5000/workerless/clxxxx/meu-consumer:sha-a1b2c3d"
 
 curl -s -X POST \
   "http://localhost:3000/tenants/${TENANT_ID}/workloads" \
@@ -223,7 +226,7 @@ curl -s -X POST \
   "http://localhost:3000/tenants/${TENANT_ID}/workloads/${APP_ID}/build" \
   -H "X-Admin-Key: troca-isso-em-producao" \
   -F "source=@meu-consumer-v2.zip" \
-  -F "registry=ghcr.io/minha-org/meu-consumer" | jq .
+  -F "registry=${REGISTRY}" | jq .
 ```
 
 ### Passo 3 — Aguardar novo `imageTag`
@@ -233,7 +236,7 @@ Mesmo fluxo do Passo 3 do deploy inicial. Aguarde `status: success`.
 ### Passo 4 — Atualizar workload (rolling update)
 
 ```bash
-NEW_IMAGE="ghcr.io/minha-org/meu-consumer:sha-e5f6g7h"
+NEW_IMAGE="10.43.100.100:5000/workerless/clxxxx/meu-consumer:sha-e5f6g7h"
 
 curl -s -X PATCH \
   "http://localhost:3000/workloads/${WORKLOAD_ID}" \
@@ -263,7 +266,7 @@ kubectl --context k3d-local-rock rollout status \
 Reverte para uma tag de imagem anterior sem reconstruir:
 
 ```bash
-PREVIOUS_IMAGE="ghcr.io/minha-org/meu-consumer:sha-a1b2c3d"
+PREVIOUS_IMAGE="10.43.100.100:5000/workerless/clxxxx/meu-consumer:sha-a1b2c3d"
 
 curl -s -X PATCH \
   "http://localhost:3000/workloads/${WORKLOAD_ID}" \
@@ -312,15 +315,15 @@ kubectl --context k3d-local-rock logs -n build-system \
 
 ### Pod não sobe: "ImagePullBackOff"
 
-O cluster não consegue baixar a imagem do registry privado.
+O cluster não consegue baixar a imagem do registry interno.
 
 ```bash
 kubectl --context k3d-local-rock describe pod \
   -n wl-acme-meu-consumer -l app=meu-consumer
 # Procure por "Failed to pull image"
 
-# Verificar se o ImagePullSecret existe no namespace
-kubectl --context k3d-local-rock get secrets -n wl-acme-meu-consumer
+# Verificar se o registry interno está pronto
+kubectl --context k3d-local-rock get deploy,svc,pvc -n build-system
 ```
 
 ### KEDA não escala: "ScaledObject not ready"

@@ -56,11 +56,15 @@ locals {
 
 locals {
   namespaces = {
+    "build-system"     = { enforce_pss = "baseline" }
     "external-secrets" = { enforce_pss = "baseline" }
     keda               = { enforce_pss = "baseline" }
     monitoring         = { enforce_pss = "privileged" } # node-exporter/grafana initContainers
     kyverno            = { enforce_pss = "privileged" }
+    workerless-system  = { enforce_pss = "baseline" }
   }
+
+  registry_node_private_cidr = var.registry_node_private_cidr != null ? var.registry_node_private_cidr : var.node_private_cidr
 }
 
 resource "kubernetes_namespace_v1" "platform" {
@@ -70,6 +74,191 @@ resource "kubernetes_namespace_v1" "platform" {
     labels = {
       "kubernetes.io/metadata.name"        = each.key
       "pod-security.kubernetes.io/enforce" = each.value.enforce_pss
+    }
+  }
+}
+
+# -------------------------------------------------------------------------
+# Registry interno — endpoint ClusterIP privado para builds Kaniko e pulls
+# dos nós. Primeiro corte: sem auth, sem NodePort/Ingress.
+# -------------------------------------------------------------------------
+
+resource "kubernetes_persistent_volume_claim_v1" "registry" {
+  wait_until_bound = false
+
+  metadata {
+    name      = "registry-data"
+    namespace = kubernetes_namespace_v1.platform["build-system"].metadata[0].name
+    labels = {
+      "app.kubernetes.io/name" = "registry"
+    }
+  }
+
+  spec {
+    access_modes       = ["ReadWriteOnce"]
+    storage_class_name = var.registry_storage.storage_class_name
+
+    resources {
+      requests = {
+        storage = var.registry_storage.size
+      }
+    }
+  }
+}
+
+resource "kubernetes_deployment_v1" "registry" {
+  metadata {
+    name      = "registry"
+    namespace = kubernetes_namespace_v1.platform["build-system"].metadata[0].name
+    labels = {
+      "app.kubernetes.io/name" = "registry"
+    }
+  }
+
+  spec {
+    replicas = 1
+
+    selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "registry"
+      }
+    }
+
+    template {
+      metadata {
+        labels = {
+          "app.kubernetes.io/name" = "registry"
+        }
+      }
+
+      spec {
+        automount_service_account_token = false
+
+        container {
+          name  = "registry"
+          image = "registry:2"
+
+          port {
+            name           = "registry"
+            container_port = var.registry_port
+            protocol       = "TCP"
+          }
+
+          env {
+            name  = "REGISTRY_HTTP_ADDR"
+            value = ":${var.registry_port}"
+          }
+
+          resources {
+            requests = {
+              cpu    = "50m"
+              memory = "128Mi"
+            }
+            limits = {
+              cpu    = "500m"
+              memory = "512Mi"
+            }
+          }
+
+          readiness_probe {
+            http_get {
+              path = "/v2/"
+              port = "registry"
+            }
+            initial_delay_seconds = 5
+            period_seconds        = 10
+          }
+
+          liveness_probe {
+            http_get {
+              path = "/v2/"
+              port = "registry"
+            }
+            initial_delay_seconds = 15
+            period_seconds        = 20
+          }
+
+          volume_mount {
+            name       = "registry-data"
+            mount_path = "/var/lib/registry"
+          }
+        }
+
+        volume {
+          name = "registry-data"
+          persistent_volume_claim {
+            claim_name = kubernetes_persistent_volume_claim_v1.registry.metadata[0].name
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_service_v1" "registry" {
+  metadata {
+    name      = "registry"
+    namespace = kubernetes_namespace_v1.platform["build-system"].metadata[0].name
+    labels = {
+      "app.kubernetes.io/name" = "registry"
+    }
+  }
+
+  spec {
+    type       = "ClusterIP"
+    cluster_ip = var.registry_service_ip
+
+    selector = {
+      "app.kubernetes.io/name" = "registry"
+    }
+
+    port {
+      name        = "registry"
+      port        = var.registry_port
+      target_port = "registry"
+      protocol    = "TCP"
+    }
+  }
+}
+
+resource "kubernetes_network_policy" "netpol_registry_ingress" {
+  metadata {
+    name      = "registry-ingress-allow"
+    namespace = kubernetes_namespace_v1.platform["build-system"].metadata[0].name
+  }
+
+  spec {
+    pod_selector {
+      match_labels = {
+        "app.kubernetes.io/name" = "registry"
+      }
+    }
+    policy_types = ["Ingress"]
+
+    ingress {
+      ports {
+        port     = tostring(var.registry_port)
+        protocol = "TCP"
+      }
+
+      from {
+        namespace_selector {
+          match_labels = { "kubernetes.io/metadata.name" = "build-system" }
+        }
+      }
+    }
+
+    dynamic "ingress" {
+      for_each = local.registry_node_private_cidr == null ? [] : [1]
+      content {
+        ports {
+          port     = tostring(var.registry_port)
+          protocol = "TCP"
+        }
+        from {
+          ip_block { cidr = local.registry_node_private_cidr }
+        }
+      }
     }
   }
 }
@@ -306,6 +495,23 @@ resource "kubernetes_network_policy" "netpol_keda_allow" {
       }
     }
 
+    dynamic "egress" {
+      for_each = var.node_private_cidr == null ? [] : [var.node_private_cidr]
+      content {
+        ports {
+          port     = "443"
+          protocol = "TCP"
+        }
+        ports {
+          port     = "6443"
+          protocol = "TCP"
+        }
+        to {
+          ip_block { cidr = egress.value }
+        }
+      }
+    }
+
     egress {
       to {
         namespace_selector {
@@ -521,6 +727,171 @@ resource "kubectl_manifest" "kyverno_pss_baseline" {
   })
 }
 
+# Guardrails da migracao da API. Comecam em Audit por default; a promocao para
+# Enforce e uma decisao explicita depois do backfill e dos testes end-to-end.
+resource "kubectl_manifest" "kyverno_workerless_namespace_contract" {
+  depends_on = [time_sleep.kyverno_webhook_ready]
+
+  yaml_body = yamlencode({
+    apiVersion = "kyverno.io/v1"
+    kind       = "ClusterPolicy"
+    metadata = {
+      name = "workerless-namespace-contract"
+    }
+    spec = {
+      background = false
+      rules = [{
+        name = "validate-api-created-namespace"
+        match = {
+          any = [{
+            resources = {
+              kinds = ["Namespace"]
+            }
+            subjects = [{
+              kind      = "ServiceAccount"
+              name      = "workerless-api-runtime"
+              namespace = "workerless-system"
+            }]
+          }]
+        }
+        validate = {
+          failureAction = var.workerless_policy_failure_action
+          message       = "Workerless namespaces must use wl-* and carry tenant, app, plan, managed-by and baseline PSS labels."
+          pattern = {
+            metadata = {
+              name = "wl-*"
+              labels = {
+                "workerless.io/tenant"                       = "?*"
+                "workerless.io/app"                          = "?*"
+                "workerless.io/plan"                         = "?*"
+                "app.kubernetes.io/managed-by"               = "workerless"
+                "pod-security.kubernetes.io/enforce"         = "baseline"
+                "pod-security.kubernetes.io/enforce-version" = "latest"
+              }
+            }
+          }
+        }
+      }]
+    }
+  })
+}
+
+resource "kubectl_manifest" "kyverno_workerless_tenant_bootstrap" {
+  depends_on = [
+    time_sleep.kyverno_webhook_ready,
+    kubernetes_cluster_role_v1.workerless_tenant_runtime,
+  ]
+
+  yaml_body = yamlencode({
+    apiVersion = "kyverno.io/v1"
+    kind       = "ClusterPolicy"
+    metadata = {
+      name = "workerless-tenant-bootstrap"
+    }
+    spec = {
+      background       = true
+      generateExisting = true
+      rules = [
+        {
+          name  = "runtime-service-account"
+          match = { any = [{ resources = { kinds = ["Namespace"], names = ["wl-*"] } }] }
+          generate = {
+            apiVersion  = "v1"
+            kind        = "ServiceAccount"
+            name        = "workerless-runtime"
+            namespace   = "{{request.object.metadata.name}}"
+            synchronize = true
+            data = {
+              automountServiceAccountToken = false
+            }
+          }
+        },
+        {
+          name  = "build-service-account"
+          match = { any = [{ resources = { kinds = ["Namespace"], names = ["wl-*"] } }] }
+          generate = {
+            apiVersion  = "v1"
+            kind        = "ServiceAccount"
+            name        = "workerless-build"
+            namespace   = "{{request.object.metadata.name}}"
+            synchronize = true
+            data = {
+              automountServiceAccountToken = false
+            }
+          }
+        },
+        {
+          name  = "api-runtime-binding"
+          match = { any = [{ resources = { kinds = ["Namespace"], names = ["wl-*"] } }] }
+          generate = {
+            apiVersion  = "rbac.authorization.k8s.io/v1"
+            kind        = "RoleBinding"
+            name        = "workerless-api-runtime"
+            namespace   = "{{request.object.metadata.name}}"
+            synchronize = true
+            data = {
+              roleRef = {
+                apiGroup = "rbac.authorization.k8s.io"
+                kind     = "ClusterRole"
+                name     = "workerless-tenant-runtime"
+              }
+              subjects = [{
+                kind      = "ServiceAccount"
+                name      = "workerless-api-runtime"
+                namespace = "workerless-system"
+              }]
+            }
+          }
+        },
+        {
+          name  = "default-deny-network-policy"
+          match = { any = [{ resources = { kinds = ["Namespace"], names = ["wl-*"] } }] }
+          generate = {
+            apiVersion  = "networking.k8s.io/v1"
+            kind        = "NetworkPolicy"
+            name        = "default-deny-all"
+            namespace   = "{{request.object.metadata.name}}"
+            synchronize = true
+            data = {
+              spec = {
+                podSelector = {}
+                policyTypes = ["Ingress", "Egress"]
+              }
+            }
+          }
+        }
+      ]
+    }
+  })
+}
+
+resource "kubectl_manifest" "kyverno_workerless_runtime_restricted" {
+  depends_on = [time_sleep.kyverno_webhook_ready]
+
+  yaml_body = yamlencode({
+    apiVersion = "kyverno.io/v1"
+    kind       = "ClusterPolicy"
+    metadata = {
+      name = "workerless-runtime-restricted"
+    }
+    spec = {
+      background = true
+      rules = [{
+        name  = "consumer-deployments-are-restricted"
+        match = { any = [{ resources = { kinds = ["Deployment"], namespaces = ["wl-*"] } }] }
+        validate = {
+          failureAction = var.workerless_policy_failure_action
+          message       = "Consumer Deployments must satisfy the Kubernetes restricted Pod Security profile."
+          podSecurity = {
+            level   = "restricted"
+            version = "latest"
+          }
+        }
+      }]
+    }
+  })
+}
+
 # -------------------------------------------------------------------------
 # Observabilidade — kube-prometheus-stack
 # -------------------------------------------------------------------------
@@ -586,11 +957,15 @@ resource "helm_release" "kube_prometheus_stack" {
           minAvailable = 1
         }
         prometheusSpec = {
-          replicas        = 2
-          resources       = local.res.kube_prometheus_stack.prometheus
-          retention       = var.monitoring_storage.prometheus_retention
-          retentionSize   = var.monitoring_storage.prometheus_retention_size
-          podAntiAffinity = "soft"
+          replicas                                = 2
+          resources                               = local.res.kube_prometheus_stack.prometheus
+          retention                               = var.monitoring_storage.prometheus_retention
+          retentionSize                           = var.monitoring_storage.prometheus_retention_size
+          podAntiAffinity                         = "soft"
+          podMonitorSelectorNilUsesHelmValues     = false
+          serviceMonitorSelectorNilUsesHelmValues = false
+          podMonitorSelector                      = {}
+          podMonitorNamespaceSelector             = {}
           topologySpreadConstraints = [{
             maxSkew           = 1
             topologyKey       = "kubernetes.io/hostname"
@@ -763,39 +1138,144 @@ resource "kubernetes_network_policy" "netpol_monitoring_allow" {
 }
 
 # -------------------------------------------------------------------------
-# ServiceAccount para acesso externo/PaaS
+# Identidade da API externa. Autorizacao global limita-se ao bootstrap do
+# namespace; operacoes de workload dependem de RoleBinding dentro de wl-*.
 # -------------------------------------------------------------------------
 
-resource "kubernetes_service_account_v1" "paas_admin" {
+resource "kubernetes_service_account_v1" "workerless_api_runtime" {
   metadata {
-    name      = "paas-admin-sa"
-    namespace = "kube-system"
+    name      = "workerless-api-runtime"
+    namespace = kubernetes_namespace_v1.platform["workerless-system"].metadata[0].name
   }
+
+  automount_service_account_token = false
 }
 
-resource "kubernetes_secret_v1" "paas_admin_token" {
+resource "kubernetes_secret_v1" "workerless_api_token" {
+  count = var.create_workerless_api_static_token ? 1 : 0
+
   metadata {
-    name      = "paas-admin-sa-token"
-    namespace = kubernetes_service_account_v1.paas_admin.metadata[0].namespace
+    name      = "workerless-api-runtime-token"
+    namespace = kubernetes_service_account_v1.workerless_api_runtime.metadata[0].namespace
     annotations = {
-      "kubernetes.io/service-account.name" = kubernetes_service_account_v1.paas_admin.metadata[0].name
+      "kubernetes.io/service-account.name" = kubernetes_service_account_v1.workerless_api_runtime.metadata[0].name
     }
   }
   type = "kubernetes.io/service-account-token"
 }
 
-resource "kubernetes_cluster_role_binding_v1" "paas_admin_binding" {
+resource "kubernetes_cluster_role_v1" "workerless_namespace_bootstrap" {
   metadata {
-    name = "paas-admin-binding"
+    name = "workerless-namespace-bootstrap"
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["namespaces"]
+    verbs      = ["get", "create"]
+  }
+
+  rule {
+    api_groups = ["authorization.k8s.io"]
+    resources  = ["selfsubjectaccessreviews"]
+    verbs      = ["create"]
+  }
+}
+
+# Role sem binding: a plataforma de CI deve vincula-la apenas a sua identidade
+# administrativa. resource_names impede emissao de token para outras SAs.
+resource "kubernetes_cluster_role_v1" "workerless_api_token_issuer" {
+  metadata {
+    name = "workerless-api-token-issuer"
+  }
+
+  rule {
+    api_groups     = [""]
+    resources      = ["serviceaccounts/token"]
+    resource_names = ["workerless-api-runtime"]
+    verbs          = ["create"]
+  }
+}
+
+resource "kubernetes_cluster_role_v1" "workerless_tenant_runtime" {
+  metadata {
+    name = "workerless-tenant-runtime"
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["pods"]
+    verbs      = ["get", "list"]
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["pods/log"]
+    verbs      = ["get"]
+  }
+
+  # get/create permanecem apenas durante a fase de compatibilidade da API.
+  rule {
+    api_groups = [""]
+    resources  = ["secrets"]
+    verbs      = ["get", "create", "patch", "delete"]
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["resourcequotas", "limitranges"]
+    verbs      = ["get", "patch", "delete"]
+  }
+
+  rule {
+    api_groups = ["apps"]
+    resources  = ["deployments"]
+    verbs      = ["get", "watch", "patch", "delete"]
+  }
+
+  rule {
+    api_groups = ["apps"]
+    resources  = ["deployments/status", "deployments/scale"]
+    verbs      = ["get", "patch"]
+  }
+
+  rule {
+    api_groups = ["batch"]
+    resources  = ["jobs"]
+    verbs      = ["get", "watch", "patch", "delete"]
+  }
+
+  rule {
+    api_groups = ["batch"]
+    resources  = ["jobs/status"]
+    verbs      = ["get"]
+  }
+
+  rule {
+    api_groups = ["networking.k8s.io"]
+    resources  = ["networkpolicies"]
+    verbs      = ["get", "patch", "delete"]
+  }
+
+  rule {
+    api_groups = ["keda.sh"]
+    resources  = ["scaledobjects", "triggerauthentications"]
+    verbs      = ["get", "create", "patch", "delete"]
+  }
+}
+
+resource "kubernetes_cluster_role_binding_v1" "workerless_namespace_bootstrap" {
+  metadata {
+    name = "workerless-namespace-bootstrap"
   }
   role_ref {
     api_group = "rbac.authorization.k8s.io"
     kind      = "ClusterRole"
-    name      = "cluster-admin"
+    name      = kubernetes_cluster_role_v1.workerless_namespace_bootstrap.metadata[0].name
   }
   subject {
     kind      = "ServiceAccount"
-    name      = kubernetes_service_account_v1.paas_admin.metadata[0].name
-    namespace = kubernetes_service_account_v1.paas_admin.metadata[0].namespace
+    name      = kubernetes_service_account_v1.workerless_api_runtime.metadata[0].name
+    namespace = kubernetes_service_account_v1.workerless_api_runtime.metadata[0].namespace
   }
 }

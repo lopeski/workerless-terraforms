@@ -4,10 +4,10 @@
 # rodar build.hetzner.sh. O mesmo token é consumido pelo envs/hetzner (criação
 # do cluster) e pelo platform/hetzner (Hetzner CSI Driver).
 
-remote_state_bucket  = "CHANGE_ME-terraform-state"
-remote_state_region  = "us-east-1"
-remote_state_env_key = "workerless-terraforms/envs/hetzner/terraform.tfstate"
-# remote_state_profile = "default"
+remote_state_bucket      = "CHANGE_ME-r2-bucket"
+remote_state_region      = "auto"
+remote_state_env_key     = "workerless-terraforms/envs/hetzner/terraform.tfstate"
+remote_state_s3_endpoint = "https://CHANGE_ME_ACCOUNT_ID.r2.cloudflarestorage.com"
 
 # Must match envs/hetzner's prometheus_node_port.
 prometheus_node_port = 30090

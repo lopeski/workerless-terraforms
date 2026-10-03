@@ -92,6 +92,13 @@ the k3d cluster is recreated. The legacy Terraform outputs `paas_sa_token` and
 
 Production does not create or export a persistent API token. See
 `docs/workerless-api-credentials.md` for TokenRequest rotation and migration.
+For the shortest Hetzner + Cloudflare R2 deployment path, see
+[`docs/guia-rapido-subida-hetzner-r2.md`](docs/guia-rapido-subida-hetzner-r2.md).
+For the complete first-production deployment procedure, see
+[`docs/hetzner-production-runbook.md`](docs/hetzner-production-runbook.md).
+For the dependency inventory, environment-variable map, and local-to-Hetzner
+promotion sequence, see
+[`docs/dependencies-and-staged-promotion.md`](docs/dependencies-and-staged-promotion.md).
 
 ## Hetzner Etcd Restore
 

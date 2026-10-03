@@ -1,8 +1,19 @@
-bucket       = "CHANGE_ME-terraform-state"
+bucket       = "CHANGE_ME-r2-bucket"
 key          = "workerless-terraforms/envs/hetzner/terraform.tfstate"
-region       = "us-east-1"
+region       = "auto"
 encrypt      = true
 use_lockfile = true
 
-# Optional when not using standard AWS environment credentials.
-# profile = "default"
+# Cloudflare R2 S3 API endpoint. Replace CHANGE_ME_ACCOUNT_ID with the
+# Cloudflare account ID (not the bucket name).
+endpoints = {
+  s3 = "https://CHANGE_ME_ACCOUNT_ID.r2.cloudflarestorage.com"
+}
+
+# Required by R2 because it does not expose AWS IAM, STS or metadata APIs.
+skip_credentials_validation = true
+skip_metadata_api_check     = true
+skip_region_validation      = true
+skip_requesting_account_id  = true
+skip_s3_checksum            = true
+use_path_style              = true

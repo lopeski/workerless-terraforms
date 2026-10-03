@@ -130,7 +130,7 @@ variable "remote_state_bucket" {
 }
 
 variable "remote_state_region" {
-  description = "AWS region for the S3 bucket that stores envs/hetzner remote state."
+  description = "Region for the S3-compatible bucket that stores envs/hetzner remote state. Use auto for Cloudflare R2."
   type        = string
 }
 
@@ -144,6 +144,16 @@ variable "remote_state_profile" {
   description = "Optional AWS profile used to read the remote state."
   type        = string
   default     = null
+}
+
+variable "remote_state_s3_endpoint" {
+  description = "Cloudflare R2 S3 endpoint used to read envs/hetzner remote state."
+  type        = string
+
+  validation {
+    condition     = can(regex("^https://[^/]+\\.r2\\.cloudflarestorage\\.com/?$", var.remote_state_s3_endpoint))
+    error_message = "remote_state_s3_endpoint must be a Cloudflare R2 HTTPS endpoint."
+  }
 }
 
 variable "hcloud_token" {
@@ -173,6 +183,17 @@ data "terraform_remote_state" "hetzner_env" {
       region = var.remote_state_region
     },
     var.remote_state_profile == null ? {} : { profile = var.remote_state_profile },
+    {
+      endpoints = {
+        s3 = var.remote_state_s3_endpoint
+      }
+      skip_credentials_validation = true
+      skip_metadata_api_check     = true
+      skip_region_validation      = true
+      skip_requesting_account_id  = true
+      skip_s3_checksum            = true
+      use_path_style              = true
+    },
   )
 }
 

@@ -30,7 +30,7 @@ run_terraform() {
 
   if [ ! -f "$DIR/backend.hcl" ]; then
     echo "ERRO: $DIR/backend.hcl não existe."
-    echo "Copie $DIR/backend.hcl.example para $DIR/backend.hcl e preencha o bucket/region."
+    echo "Copie $DIR/backend.hcl.example para $DIR/backend.hcl e preencha o bucket e o account ID do R2."
     exit 1
   fi
 

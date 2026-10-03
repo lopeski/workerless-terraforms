@@ -678,6 +678,36 @@ resource "time_sleep" "kyverno_webhook_ready" {
   create_duration = "30s"
 }
 
+# Kyverno valida no admission se o background controller pode criar todos os
+# recursos declarados em generate. O chart ja agrega RoleBindings e
+# NetworkPolicies; ServiceAccounts precisam desta extensao explicita.
+resource "kubernetes_cluster_role_v1" "kyverno_generate_service_accounts" {
+  metadata {
+    name = "kyverno:background-controller:workerless-serviceaccounts"
+    labels = {
+      "rbac.kyverno.io/aggregate-to-background-controller" = "true"
+    }
+  }
+
+  rule {
+    api_groups = [""]
+    resources  = ["serviceaccounts"]
+    verbs      = ["get", "create", "update", "patch", "delete"]
+  }
+
+  rule {
+    api_groups = ["rbac.authorization.k8s.io"]
+    resources  = ["rolebindings"]
+    verbs      = ["get", "create", "update", "patch", "delete"]
+  }
+
+  rule {
+    api_groups = ["networking.k8s.io"]
+    resources  = ["networkpolicies"]
+    verbs      = ["get", "create", "update", "patch", "delete"]
+  }
+}
+
 # Intencionalmente gavinbunney/kubectl em vez de hashicorp/kubernetes_manifest:
 # o CRD ClusterPolicy é instalado pelo helm_release.kyverno acima no mesmo apply,
 # e kubernetes_manifest exigiria o CRD presente já no plan-time. Reavaliar quando
@@ -779,6 +809,7 @@ resource "kubectl_manifest" "kyverno_workerless_namespace_contract" {
 resource "kubectl_manifest" "kyverno_workerless_tenant_bootstrap" {
   depends_on = [
     time_sleep.kyverno_webhook_ready,
+    kubernetes_cluster_role_v1.kyverno_generate_service_accounts,
     kubernetes_cluster_role_v1.workerless_tenant_runtime,
   ]
 
@@ -888,6 +919,75 @@ resource "kubectl_manifest" "kyverno_workerless_runtime_restricted" {
           }
         }
       }]
+    }
+  })
+}
+
+resource "kubectl_manifest" "kyverno_workerless_identity_boundaries" {
+  depends_on = [time_sleep.kyverno_webhook_ready]
+
+  yaml_body = yamlencode({
+    apiVersion = "kyverno.io/v1"
+    kind       = "ClusterPolicy"
+    metadata = {
+      name = "workerless-identity-boundaries"
+    }
+    spec = {
+      # A regra de Secret usa request.userInfo (subjects), indisponivel no
+      # background scan. As tres regras continuam auditando admission requests.
+      background = false
+      rules = [
+        {
+          name  = "runtime-deployments-use-runtime-sa"
+          match = { any = [{ resources = { kinds = ["Deployment"], namespaces = ["wl-*"] } }] }
+          validate = {
+            failureAction = var.workerless_policy_failure_action
+            message       = "Consumer Deployments must use workerless-runtime."
+            pattern = {
+              spec = { template = { spec = { serviceAccountName = "workerless-runtime" } } }
+            }
+          }
+        },
+        {
+          name  = "build-jobs-use-build-sa"
+          match = { any = [{ resources = { kinds = ["Job"], namespaces = ["wl-*"] } }] }
+          validate = {
+            failureAction = var.workerless_policy_failure_action
+            message       = "Build Jobs must use workerless-build."
+            pattern = {
+              spec = { template = { spec = { serviceAccountName = "workerless-build" } } }
+            }
+          }
+        },
+        {
+          name = "api-mutates-only-managed-secrets"
+          match = {
+            any = [{
+              resources = {
+                kinds      = ["Secret"]
+                namespaces = ["wl-*"]
+                operations = ["CREATE", "UPDATE"]
+              }
+              subjects = [{
+                kind      = "ServiceAccount"
+                name      = "workerless-api-runtime"
+                namespace = "workerless-system"
+              }]
+            }]
+          }
+          validate = {
+            failureAction = var.workerless_policy_failure_action
+            message       = "The API may mutate only Secrets labelled app.kubernetes.io/managed-by=workerless."
+            pattern = {
+              metadata = {
+                labels = {
+                  "app.kubernetes.io/managed-by" = "workerless"
+                }
+              }
+            }
+          }
+        }
+      ]
     }
   })
 }

@@ -1,4 +1,8 @@
-# Permissoes RBAC do control-plane da PaaS
+# Permissoes RBAC do control-plane da PaaS (legado)
+
+> Este documento descreve a identidade `paas-admin-sa` removida pela migracao.
+> Para o contrato atual de `workerless-api-runtime`, TokenRequest e RBAC por
+> namespace, consulte [workerless-api-credentials.md](workerless-api-credentials.md).
 
 Este documento registra as permissoes Kubernetes necessarias para o service account
 `system:serviceaccount:kube-system:paas-admin-sa`, usado pela API Workerless para

@@ -33,3 +33,8 @@ run_terraform() {
 
 run_terraform "envs/local"
 run_terraform "platform/local" "true"
+
+./scripts/generate-workerless-api-env.sh
+
+echo "Credenciais limitadas da API gravadas em platform/local/workerless-api.local.env"
+echo "Na API: set -a; source ../workerless-terraforms/platform/local/workerless-api.local.env; set +a; yarn start:dev"

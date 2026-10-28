@@ -28,7 +28,9 @@ jobs:
       - name: terraform fmt -check (all layers)
         run: |
           set -e
-          for d in envs/hetzner envs/local platform/hetzner platform/local modules/core-platform modules/workload; do
+          for d in envs/hetzner envs/local platform/hetzner platform/local modules/core-platform modules/workload \
+                   modules/security-guard-grpc modules/tailscale-operator modules/cloudflare-operational-blocking \
+                   modules/security-evidence-r2 modules/security-datastore-acl modules/security-monitoring; do
             echo "==> fmt-check $d"
             terraform fmt -check -recursive "$d"
           done
@@ -46,6 +48,12 @@ jobs:
           - platform/local
           - modules/core-platform
           - modules/workload
+          - modules/security-guard-grpc
+          - modules/tailscale-operator
+          - modules/cloudflare-operational-blocking
+          - modules/security-evidence-r2
+          - modules/security-datastore-acl
+          - modules/security-monitoring
     steps:
       - uses: actions/checkout@v4
 
@@ -169,3 +177,361 @@ jobs:
               issue_number: context.issue.number,
               body,
             });
+
+  # -------------------------------------------------------------------------
+  # Security Guard: static checks (no live infra). These are deliberately
+  # lightweight grep/python substitutes for a full OPA/conftest policy-as-code
+  # toolchain — judged not worth a new toolchain dependency for this pass.
+  # Add real conftest policies later if the grep-based checks start missing
+  # real regressions.
+  # -------------------------------------------------------------------------
+
+  no-secrets-in-outputs:
+    name: no-secrets-in-outputs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan every output block for credential-shaped names missing sensitive = true
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+          import re
+          import sys
+
+          # Names of things (role names, secret-ref pointers, issuer names, key
+          # prefixes, resource IDs) are not credential values — excluded by suffix.
+          SAFE_SUFFIXES = ("_name", "_names", "_ref", "_refs", "_prefix", "_id", "_ids")
+          CRED_PATTERN = re.compile(r"(token|secret|password|key)", re.IGNORECASE)
+
+          files = sorted(set(glob.glob("modules/*/*.tf") + glob.glob("platform/*/*.tf")))
+
+          failures = []
+          for path in files:
+              text = open(path, encoding="utf-8").read()
+              pos = 0
+              while True:
+                  m = re.search(r'output\s+"([^"]+)"\s*\{', text[pos:])
+                  if not m:
+                      break
+                  name = m.group(1)
+                  start = pos + m.end() - 1  # position of the opening brace
+                  depth = 0
+                  j = start
+                  while j < len(text):
+                      if text[j] == "{":
+                          depth += 1
+                      elif text[j] == "}":
+                          depth -= 1
+                          if depth == 0:
+                              break
+                      j += 1
+                  block = text[start : j + 1]
+                  pos = j + 1
+
+                  if not CRED_PATTERN.search(name):
+                      continue
+                  if name.endswith(SAFE_SUFFIXES):
+                      continue
+                  if not re.search(r"sensitive\s*=\s*true", block):
+                      failures.append(
+                          f'{path}: output "{name}" looks credential-shaped but has no sensitive = true'
+                      )
+
+          if failures:
+              print("FAIL: outputs that look like they could leak a credential value:")
+              for f in failures:
+                  print(f"  - {f}")
+              sys.exit(1)
+
+          print(f"OK: scanned {len(files)} files, no unmarked credential-shaped outputs found.")
+          PYEOF
+
+  policy-checks:
+    name: policy-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Static checks — no public exposure, deny/allow NetworkPolicy pairing
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+          import re
+          import sys
+
+          fail = False
+
+          def find_blocks(text, resource_type):
+              out = []
+              for m in re.finditer(r'resource\s+"' + re.escape(resource_type) + r'"\s+"([^"]+)"\s*\{', text):
+                  name = m.group(1)
+                  start = m.end() - 1
+                  depth = 0
+                  j = start
+                  while j < len(text):
+                      if text[j] == "{":
+                          depth += 1
+                      elif text[j] == "}":
+                          depth -= 1
+                          if depth == 0:
+                              break
+                      j += 1
+                  out.append((name, text[start : j + 1]))
+              return out
+
+          # 1. gRPC/audit-facing modules must never expose a Service outside ClusterIP.
+          for path in ["modules/security-guard-grpc/main.tf", "modules/security-monitoring/main.tf"]:
+              text = open(path, encoding="utf-8").read()
+              for name, block in find_blocks(text, "kubernetes_service_v1"):
+                  bad = re.search(r'type\s*=\s*"(NodePort|LoadBalancer)"', block)
+                  if bad:
+                      print(f'FAIL: {path} Service "{name}" has type = "{bad.group(1)}" — must stay ClusterIP')
+                      fail = True
+
+          # 2. No Ingress-kind manifest anywhere near the gRPC/audit/platform paths.
+          for base in [
+              "modules/security-guard-grpc",
+              "modules/security-monitoring",
+              "modules/tailscale-operator",
+              "platform/local",
+              "platform/hetzner",
+          ]:
+              for path in glob.glob(f"{base}/*.tf"):
+                  text = open(path, encoding="utf-8").read()
+                  if re.search(r'kind\s*=\s*"Ingress"', text):
+                      print(f"FAIL: {path} declares an Ingress-kind manifest — gRPC must stay Tailscale L3/ClusterIP-only")
+                      fail = True
+
+          # 3. Every NetworkPolicy "allow" in these modules has a matching default-deny.
+          #    Matched against the Kubernetes object's metadata.name (what Kyverno/kubectl
+          #    actually sees), not the Terraform resource label — modules name their HCL
+          #    resource identifiers freely (e.g. falco_egress, collector_policy) while the
+          #    k8s-level NetworkPolicy name is what carries the deny/allow convention.
+          netpol_files = sorted(set(
+              glob.glob("modules/security-*/main.tf")
+              + glob.glob("modules/tailscale-operator/main.tf")
+              + glob.glob("modules/core-platform/main.tf")
+          ))
+          for path in netpol_files:
+              text = open(path, encoding="utf-8").read()
+              deny_count = 0
+              allow_count = 0
+              for tf_name, block in find_blocks(text, "kubernetes_network_policy"):
+                  nm = re.search(r'name\s*=\s*"([^"]+)"', block)
+                  k8s_name = nm.group(1) if nm else tf_name
+                  if re.search(r"deny", k8s_name, re.IGNORECASE):
+                      deny_count += 1
+                  elif re.search(r"allow", k8s_name, re.IGNORECASE):
+                      allow_count += 1
+              if allow_count > 0 and deny_count == 0:
+                  print(f'FAIL: {path} has an "allow" NetworkPolicy with no matching default-deny policy')
+                  fail = True
+
+          if fail:
+              sys.exit(1)
+          print("OK: policy-checks passed.")
+          PYEOF
+
+  # -------------------------------------------------------------------------
+  # Security Guard: live-infra tests. Both are scoped to the one genuinely
+  # security-critical, CI-automatable assertion from their respective spec
+  # sections — not a full feature smoke test. Everything else that needs a
+  # live tailnet/Cloudflare zone/R2 bucket is explicitly left for manual or
+  # workflow_dispatch staging verification (see each module's README).
+  # -------------------------------------------------------------------------
+
+  collector-rbac-test:
+    name: collector-rbac-test
+    runs-on: ubuntu-latest
+    needs:
+      - fmt-check
+      - validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install k3d
+        run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+      - name: Create disposable k3d cluster (envs/local)
+        working-directory: envs/local
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false
+
+      - name: Apply collector RBAC only (core-platform + security-monitoring's ServiceAccount/ClusterRole/Role)
+        working-directory: platform/local
+        env:
+          TF_VAR_security_monitoring_enabled: "true"
+          # Falco/Vector/the collector workload itself are deliberately NOT
+          # targeted below — Falco needs host eBPF/kmod driver support a
+          # GitHub Actions runner's kernel can't guarantee, and a full apply
+          # would hang this job on an undeployable DaemonSet. We only need
+          # the collector's real RBAC objects live on a real API server so
+          # `kubectl auth can-i` below tests the actual object, not a plan.
+          TF_VAR_falco_image_digest: "0000000000000000000000000000000000000000000000000000000000000000"
+          TF_VAR_audit_ingestion_allowed_cidr: "10.10.1.0/24"
+          TF_VAR_collector_image: "busybox:1.36"
+          TF_VAR_collector_watched_resources: '[{"api_groups":[""],"resources":["pods"],"verbs":["get","list","watch"]}]'
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false \
+            -target='module.core_platform' \
+            -target='module.security_monitoring[0].kubernetes_namespace_v1.security_monitoring' \
+            -target='module.security_monitoring[0].kubernetes_service_account_v1.security_collector' \
+            -target='module.security_monitoring[0].kubernetes_cluster_role_v1.security_collector' \
+            -target='module.security_monitoring[0].kubernetes_cluster_role_binding_v1.security_collector' \
+            -target='module.security_monitoring[0].kubernetes_role_v1.security_collector_lease' \
+            -target='module.security_monitoring[0].kubernetes_role_binding_v1.security_collector_lease'
+
+      - name: kubectl auth can-i — collector must NOT read Secrets
+        run: |
+          set -e
+          result=$(kubectl auth can-i get secrets -A \
+            --as=system:serviceaccount:security-monitoring:security-collector \
+            --context k3d-local-rock)
+          echo "kubectl auth can-i get secrets -A => $result"
+          if [ "$result" != "no" ]; then
+            echo "FAIL: security-collector ServiceAccount can read Secrets cluster-wide"
+            exit 1
+          fi
+          echo "OK: collector RBAC correctly denies cluster-wide Secret access."
+
+      - name: Tear down k3d cluster
+        if: always()
+        run: k3d cluster delete local-rock || true
+
+  datastore-acl-test:
+    name: datastore-acl-test
+    runs-on: ubuntu-latest
+    needs:
+      - fmt-check
+      - validate
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: admin
+          POSTGRES_PASSWORD: admin
+          POSTGRES_DB: security_guard_test
+          # Trust auth so the module's generated readonly/writer roles (which
+          # this module deliberately never sets a password for) can still
+          # authenticate over the loopback connection in this disposable,
+          # CI-only container. platform/<env>'s real provider block hardcodes
+          # sslmode = "verify-full" against a real managed Postgres — this is
+          # a CI-local shortcut, not a statement about production auth.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U admin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install postgresql-client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Seed a test schema/table
+        run: |
+          psql -h localhost -U admin -d security_guard_test -c "CREATE SCHEMA IF NOT EXISTS security;"
+          psql -h localhost -U admin -d security_guard_test -c "CREATE TABLE IF NOT EXISTS security.events (id serial primary key, payload text);"
+
+      - name: Write a throwaway wrapper root module (never committed — CI-only)
+        run: |
+          mkdir -p /tmp/datastore-acl-ci
+          cat > /tmp/datastore-acl-ci/main.tf <<EOF
+          terraform {
+            required_providers {
+              postgresql = { source = "cyrilgdn/postgresql", version = "~> 1.27" }
+              kafka      = { source = "Mongey/kafka", version = "~> 0.13" }
+            }
+          }
+
+          provider "postgresql" {
+            alias           = "security_datastore"
+            host            = "localhost"
+            port            = 5432
+            database        = "security_guard_test"
+            username        = "admin"
+            password        = "admin"
+            sslmode         = "disable"
+            connect_timeout = 10
+            superuser       = false
+          }
+
+          provider "kafka" {
+            alias             = "security_datastore"
+            bootstrap_servers = []
+            tls_enabled       = false
+          }
+
+          module "security_datastore_acl" {
+            source = "$GITHUB_WORKSPACE/modules/security-datastore-acl"
+
+            providers = {
+              postgresql = postgresql.security_datastore
+              kafka      = kafka.security_datastore
+            }
+
+            security_datastore_acl_enabled = true
+            postgresql_database            = "security_guard_test"
+            postgresql_security_schema     = "security"
+            postgresql_security_tables     = ["events"]
+            postgresql_schema_owner_role   = "admin"
+          }
+
+          output "postgresql_readonly_role_name" {
+            value = module.security_datastore_acl.postgresql_readonly_role_name
+          }
+          EOF
+
+      - name: terraform init/apply the wrapper
+        working-directory: /tmp/datastore-acl-ci
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false
+
+      - name: Attempt writes as the read-only role — every one must fail
+        run: |
+          set -e
+          cd /tmp/datastore-acl-ci
+          ROLE=$(terraform output -raw postgresql_readonly_role_name)
+          echo "Testing role: $ROLE"
+          fail=0
+          while IFS= read -r stmt; do
+            if psql -h localhost -U "$ROLE" -d security_guard_test -c "$stmt" 2>/tmp/err.txt; then
+              echo "FAIL: role $ROLE was able to execute: $stmt"
+              fail=1
+            else
+              grep -qi "permission denied" /tmp/err.txt || echo "WARN: non-permission-denied error for '$stmt': $(cat /tmp/err.txt)"
+            fi
+          done <<'STATEMENTS'
+          INSERT INTO security.events (payload) VALUES ('x')
+          UPDATE security.events SET payload = 'x'
+          DELETE FROM security.events
+          TRUNCATE security.events
+          ALTER TABLE security.events ADD COLUMN extra text
+          CREATE TABLE security.should_fail (id int)
+          STATEMENTS
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "OK: read-only role could not write, alter, or create."
+
+      - name: Destroy wrapper
+        if: always()
+        working-directory: /tmp/datastore-acl-ci
+        run: terraform destroy -auto-approve -input=false || true

@@ -1,12 +1,16 @@
 # Workerless API Kubernetes credentials
 
-The API always consumes the same contract:
+The external integration preserves this contract:
 
 - `KUBERNETES_SERVER_URL`
 - `KUBERNETES_BEARER_TOKEN`
 - `KUBERNETES_CA_DATA_BASE64`
 
-It does not access a secret manager directly.
+In production, only `KUBERNETES_SERVER_URL` and
+`KUBERNETES_CA_DATA_BASE64` enter the Nest Container. The Cloudflare outbound
+handler owns `KUBERNETES_BEARER_TOKEN` and injects it, together with Access
+service-token headers, only for the Kubernetes Tunnel hostname. Local
+development may still pass all three values directly.
 
 ## Local development
 
@@ -37,9 +41,15 @@ and exposes no credential output. CI must:
    kubectl -n workerless-system create token workerless-api-runtime --duration=1h
    ```
 
-4. Store it in the production secret manager under the API's existing
-   `KUBERNETES_BEARER_TOKEN` key and trigger a rolling restart.
-5. Rotate before 50% of its lifetime and alert if 25% or less remains.
+4. Store it as the Worker secret `KUBERNETES_BEARER_TOKEN`. Do not pass it to
+   the Container and do not restart the Nest process.
+5. Rotate every 20 minutes. Publish only after successful issuance so failure
+   leaves the prior token intact; alert on a failed scheduled run, which occurs
+   before the one-hour token reaches 25% remaining lifetime.
+
+The separate `cloudflared-connector` module runs the in-cluster connector. It
+references a pre-existing Secret containing the Tunnel token; the token value
+never enters this repository's Terraform state.
 
 The CI identity and secret-manager binding are environment-specific and are
 intentionally not created by this repository.

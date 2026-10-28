@@ -9,8 +9,106 @@ remote_state_region      = "auto"
 remote_state_env_key     = "workerless-terraforms/envs/hetzner/terraform.tfstate"
 remote_state_s3_endpoint = "https://CHANGE_ME_ACCOUNT_ID.r2.cloudflarestorage.com"
 
-# Must match envs/hetzner's prometheus_node_port.
-prometheus_node_port = 30090
+# Production reaches Prometheus through the authenticated Cloudflare Tunnel.
+prometheus_node_port = null
+
+# Enable only after creating workerless-system/workerless-cloudflared-tunnel
+# with key `token` from the workerless-api Terraform Tunnel output.
+cloudflared_connector_enabled          = false
+cloudflared_tunnel_token_secret_name  = "workerless-cloudflared-tunnel"
+
+# -----------------------------------------------------------------------
+# Workerless Security Guard. Profile notes:
+#
+# - Local (platform/local): every *_enabled flag defaults false in main.tf
+#   — no fake resources, no placeholder credentials.
+# - Staging: this repo has no native "staging" Terraform directory. Stand
+#   up a SECOND, isolated Hetzner deployment (own backend.hcl key, own
+#   hcloud project if possible, own Cloudflare zone/account, own R2 bucket,
+#   own tailnet) using this exact envs/hetzner + platform/hetzner pair, and
+#   point every variable below at that isolated set of resources. Never
+#   reuse production's Cloudflare zone, R2 bucket, or tailnet for staging.
+# - Production: set is_production = true below to arm the production-only
+#   validations (tailscale proxy_group_replicas >= 2,
+#   r2_evidence_retention_days >= 365).
+#
+# Every *_enabled flag below is false until filled in — CHANGE_ME values
+# are placeholders, not usable defaults.
+# -----------------------------------------------------------------------
+
+is_production = false # set true only for the real production deployment
+
+# Required when is_production = true. Collect requests, init-container maxima,
+# pod overhead, DaemonSets, pending pods, PVCs and placement constraints.
+# Commercial consumer reservations belong exclusively to workerless-api.
+n_minus_one_capacity_snapshot = null
+
+security_guard_grpc_enabled           = false
+guard_grpc_image                      = "ghcr.io/workerless/security-guard-grpc:CHANGE_ME"
+guard_grpc_tailnet_hostname           = "guard-grpc.CHANGE_ME.ts.net"
+guard_grpc_db_egress_cidr             = "CHANGE_ME/32"
+guard_grpc_db_credentials_secret_ref = {
+  secret_store_name = "tenant-secrets"
+  secret_store_kind = "ClusterSecretStore"
+}
+
+tailscale_operator_enabled = false # true enables private kubectl access through Tailscale
+# Export via TF_VAR_tailscale_tf_oauth_client_id / TF_VAR_tailscale_tf_oauth_client_secret
+# — never commit real values here. This is the Terraform-PROVIDER's own
+# credential (owns the full tailscale_acl), distinct from
+# tailscale_oauth_secret_ref below (the in-cluster Operator's own OAuth client).
+tailscale_operator_tag        = "tag:guard-operator"
+tailscale_proxy_tag           = "tag:guard-proxy"
+tailscale_allowed_device_tags = ["tag:guard-admin-mac"]
+# Each tag above receives Kubernetes cluster-admin through a ClusterRoleBinding.
+# Use a dedicated tag assigned only to managed administrator devices.
+tailscale_oauth_secret_ref = {
+  secret_store_name = "tenant-secrets"
+  secret_store_kind = "ClusterSecretStore"
+}
+
+cloudflare_operational_blocking_enabled = false
+# Export via TF_VAR_cloudflare_waf_api_token — distinct from cloudflare_r2_api_token below.
+cloudflare_account_id              = "CHANGE_ME"
+cloudflare_zone_ids                = ["CHANGE_ME"]
+cloudflare_guard_list_name         = "workerless_guard_block_prod"
+cloudflare_guard_rule_expression   = "(ip.src in $workerless_guard_block_prod)"
+cloudflare_protected_endpoints     = ["guard-api.example.com"]
+cloudflare_guard_token_backend_key = "cloudflare-guard-runtime-token"
+cloudflare_guard_token_secret_ref = {
+  secret_store_name = "tenant-secrets"
+  secret_store_kind = "ClusterSecretStore"
+}
+
+r2_evidence_enabled = false
+# Export via TF_VAR_cloudflare_r2_api_token — distinct from cloudflare_waf_api_token above.
+r2_evidence_bucket_name    = "workerless-guard-evidence-prod"
+r2_evidence_retention_days = 365 # must stay >= 365 once is_production = true
+r2_evidence_token_secret_ref = {
+  secret_store_name = "tenant-secrets"
+  secret_store_kind = "ClusterSecretStore"
+}
+
+security_datastore_acl_enabled = false
+postgresql_host                = "CHANGE_ME"
+postgresql_database            = "security"
+postgresql_security_tables     = ["events", "alerts"]
+# postgresql_admin_credentials_secret_ref / kafka_admin_credentials_secret_ref
+# are live-connection bootstrap credentials (the postgresql/kafka providers
+# connect at plan/apply time) — export via TF_VAR_*, never commit here.
+kafka_bootstrap_servers   = ["CHANGE_ME:9092"]
+kafka_api_principal       = "User:security-guard-api"
+kafka_collector_principal = "User:security-collector"
+
+security_monitoring_enabled  = false
+falco_image_digest           = "CHANGE_ME_64_HEX_SHA256_DIGEST"
+audit_ingestion_allowed_cidr = "10.10.1.0/24" # k3s control-plane private CIDR, see envs/hetzner
+collector_image               = "ghcr.io/workerless/security-collector:CHANGE_ME"
+collector_watched_resources = [
+  { api_groups = [""], resources = ["pods"], verbs = ["get", "list", "watch"] },
+  { api_groups = ["apps"], resources = ["deployments"], verbs = ["get", "list", "watch"] },
+  { api_groups = [""], resources = ["events"], verbs = ["get", "list", "watch"] },
+]
 
 plans = {
   starter = {
@@ -56,7 +154,7 @@ plans = {
   }
 }
 
-workloads = {
+workloads = { # MUST remain {} when is_production = true
   "orders-consumer" = {
     tenant_id    = "acme"
     plan_key     = "starter"

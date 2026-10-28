@@ -14,6 +14,12 @@
       <excludeFolder url="file://$MODULE_DIR$/pecas/.terraform" />
       <excludeFolder url="file://$MODULE_DIR$/platform/hetzner/.terraform" />
       <excludeFolder url="file://$MODULE_DIR$/platform/local/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/modules/cloudflare-operational-blocking/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/modules/security-datastore-acl/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/modules/security-evidence-r2/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/modules/security-guard-grpc/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/modules/security-monitoring/.terraform" />
+      <excludeFolder url="file://$MODULE_DIR$/modules/tailscale-operator/.terraform" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

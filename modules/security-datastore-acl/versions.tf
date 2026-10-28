@@ -1,0 +1,6 @@
+terraform {
+  required_providers {
+    postgresql = { source = "cyrilgdn/postgresql", version = "~> 1.27" }
+    kafka      = { source = "Mongey/kafka", version = "~> 0.13" }
+  }
+}

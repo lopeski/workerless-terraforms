@@ -28,6 +28,11 @@ locals {
       alertmanager = { requests = { cpu = "50m", memory = "128Mi" }, limits = { cpu = "200m", memory = "256Mi" } }
       grafana      = { requests = { cpu = "100m", memory = "256Mi" }, limits = { cpu = "500m", memory = "512Mi" } }
     }
+    cert_manager = {
+      controller = { requests = { cpu = "50m", memory = "64Mi" }, limits = { cpu = "500m", memory = "256Mi" } }
+      webhook    = { requests = { cpu = "25m", memory = "32Mi" }, limits = { cpu = "200m", memory = "128Mi" } }
+      cainjector = { requests = { cpu = "50m", memory = "64Mi" }, limits = { cpu = "500m", memory = "256Mi" } }
+    }
   }
 
   res = {
@@ -62,6 +67,7 @@ locals {
     monitoring         = { enforce_pss = "privileged" } # node-exporter/grafana initContainers
     kyverno            = { enforce_pss = "privileged" }
     workerless-system  = { enforce_pss = "baseline" }
+    "cert-manager"     = { enforce_pss = "privileged" } # webhook/cainjector precisam de capacidades elevadas
   }
 
   registry_node_private_cidr = var.registry_node_private_cidr != null ? var.registry_node_private_cidr : var.node_private_cidr
@@ -739,6 +745,7 @@ resource "kubectl_manifest" "kyverno_pss_baseline" {
                     "kube-node-lease",
                     "kyverno",
                     "monitoring",
+                    "security-monitoring",
                   ]
                 }]
               }
@@ -993,6 +1000,132 @@ resource "kubectl_manifest" "kyverno_workerless_identity_boundaries" {
 }
 
 # -------------------------------------------------------------------------
+# cert-manager — PKI de cluster-singleton consumida por módulos downstream
+# (security-guard-grpc, security-monitoring) para emitir CAs/Certificates
+# próprios via Issuer/ClusterIssuer. O controller fica aqui (como ESO/KEDA/
+# Kyverno); cada consumidor é dono de seu próprio domínio de CA — nenhuma
+# delas é criada neste módulo.
+# -------------------------------------------------------------------------
+
+resource "helm_release" "cert_manager" {
+  depends_on = [kubernetes_namespace_v1.platform]
+
+  name             = "cert-manager"
+  repository       = "https://charts.jetstack.io"
+  chart            = "cert-manager"
+  namespace        = kubernetes_namespace_v1.platform["cert-manager"].metadata[0].name
+  create_namespace = false
+  version          = "v1.21.2"
+
+  wait    = true
+  timeout = 600
+  atomic  = true
+
+  values = [yamlencode({
+    crds = {
+      enabled = true
+    }
+
+    replicaCount = 2
+    resources    = local.res.cert_manager.controller
+    podDisruptionBudget = {
+      enabled      = true
+      minAvailable = 1
+    }
+
+    webhook = {
+      replicaCount = 2
+      resources    = local.res.cert_manager.webhook
+      podDisruptionBudget = {
+        enabled      = true
+        minAvailable = 1
+      }
+    }
+
+    cainjector = {
+      replicaCount = 2
+      resources    = local.res.cert_manager.cainjector
+      podDisruptionBudget = {
+        enabled      = true
+        minAvailable = 1
+      }
+    }
+  })]
+}
+
+# Registro do webhook de admissão é assíncrono — módulos consumidores devem
+# depend_on este sleep (via depends_on transitivo em module.core_platform)
+# antes de criar Issuer/Certificate/ClusterIssuer, mesma race do Kyverno.
+resource "time_sleep" "cert_manager_webhook_ready" {
+  depends_on      = [helm_release.cert_manager]
+  create_duration = "30s"
+}
+
+resource "kubernetes_network_policy" "netpol_cert_manager_deny" {
+  depends_on = [helm_release.cert_manager]
+
+  metadata {
+    name      = "default-deny-all"
+    namespace = kubernetes_namespace_v1.platform["cert-manager"].metadata[0].name
+  }
+  spec {
+    pod_selector {}
+    policy_types = ["Ingress", "Egress"]
+  }
+}
+
+resource "kubernetes_network_policy" "netpol_cert_manager_allow" {
+  depends_on = [kubernetes_network_policy.netpol_cert_manager_deny]
+
+  metadata {
+    name      = "cert-manager-allow"
+    namespace = kubernetes_namespace_v1.platform["cert-manager"].metadata[0].name
+  }
+  spec {
+    pod_selector {}
+    policy_types = ["Ingress", "Egress"]
+
+    # kube-apiserver → webhook (validação de admissão de Certificate/Issuer)
+    ingress {
+      ports {
+        port     = "10250"
+        protocol = "TCP"
+      }
+      from {
+        ip_block { cidr = "0.0.0.0/0" }
+      }
+    }
+
+    # controller/cainjector/webhook → kube-apiserver
+    egress {
+      ports {
+        port     = "6443"
+        protocol = "TCP"
+      }
+      to {
+        ip_block { cidr = "0.0.0.0/0" }
+      }
+    }
+
+    egress {
+      ports {
+        port     = "53"
+        protocol = "UDP"
+      }
+      ports {
+        port     = "53"
+        protocol = "TCP"
+      }
+      to {
+        namespace_selector {
+          match_labels = { "kubernetes.io/metadata.name" = "kube-system" }
+        }
+      }
+    }
+  }
+}
+
+# -------------------------------------------------------------------------
 # Observabilidade — kube-prometheus-stack
 # -------------------------------------------------------------------------
 
@@ -1178,13 +1311,29 @@ resource "kubernetes_network_policy" "netpol_monitoring_allow" {
       }
     }
 
+    # The production Cloudflare Tunnel originates in workerless-system and
+    # reaches only the internal Prometheus HTTP endpoint.
+    ingress {
+      ports {
+        port     = "9090"
+        protocol = "TCP"
+      }
+      from {
+        namespace_selector {
+          match_labels = {
+            "kubernetes.io/metadata.name" = "workerless-system"
+          }
+        }
+      }
+    }
+
     # Prometheus via NodePort para consumidor externo ao cluster (ex.: PaaS
     # control-plane). O tráfego chega ao pod já com SNAT para o IP privado do
     # nó que recebeu a conexão — quem restringe quais IPs externos acessam o
     # NodePort é o firewall da Hetzner (control_plane_cidrs em envs/hetzner),
     # não esta policy.
     dynamic "ingress" {
-      for_each = var.node_private_cidr == null ? [] : [1]
+      for_each = var.prometheus_node_port == null || var.node_private_cidr == null ? [] : [1]
       content {
         ports {
           port     = "9090"

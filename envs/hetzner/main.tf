@@ -2,7 +2,7 @@ terraform {
   backend "s3" {}
 
   required_providers {
-    hcloud   = { source = "hetznercloud/hcloud", version = "~> 1.45" }
+    hcloud   = { source = "hetznercloud/hcloud", version = "~> 1.68.0" }
     null     = { source = "hashicorp/null", version = "~> 3.2" }
     external = { source = "hashicorp/external", version = "~> 2.3" }
     random   = { source = "hashicorp/random", version = "~> 3.6" }
@@ -19,12 +19,6 @@ variable "ssh_public_key_path" {
   description = "Path para a chave SSH pública (default ~/.ssh/id_rsa.pub)"
   type        = string
   default     = "~/.ssh/id_rsa.pub"
-}
-
-variable "ssh_private_key_path" {
-  description = "Path para a chave SSH privada usada nas conexões remotas"
-  type        = string
-  default     = "~/.ssh/id_rsa"
 }
 
 variable "k3s_version" {
@@ -79,21 +73,28 @@ variable "admin_cidrs" {
 }
 
 variable "control_plane_cidrs" {
-  description = "CIDRs do host que roda o control-plane da PaaS (ex.: workerless-api), autorizado a acessar a API Kubernetes (6443) e o Prometheus (prometheus_node_port). Separado de admin_cidrs para não conceder SSH a esse host."
+  description = "CIDRs opcionais para acesso legado da API externa ao Kubernetes (6443) e Prometheus NodePort. Em produção com Cloudflare Tunnel, mantenha vazio."
   type        = list(string)
+  default     = []
 
   validation {
-    condition = length(var.control_plane_cidrs) > 0 && alltrue([
+    condition = alltrue([
       for cidr in var.control_plane_cidrs : cidr != "0.0.0.0/0" && cidr != "::/0"
     ])
-    error_message = "control_plane_cidrs is required and must not include 0.0.0.0/0 or ::/0."
+    error_message = "control_plane_cidrs must not include 0.0.0.0/0 or ::/0."
   }
 }
 
 variable "prometheus_node_port" {
-  description = "NodePort usado para expor o Prometheus ao control-plane externo (deve bater com o mesmo valor em platform/hetzner)."
+  description = "NodePort legado do Prometheus. Use null em produção com Cloudflare Tunnel."
   type        = number
-  default     = 30090
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.prometheus_node_port == null || (var.prometheus_node_port >= 30000 && var.prometheus_node_port <= 32767)
+    error_message = "prometheus_node_port must be null or a valid NodePort between 30000 and 32767."
+  }
 }
 
 variable "etcd_snapshot_schedule_cron" {
@@ -113,6 +114,39 @@ variable "etcd_snapshot_retention" {
   }
 }
 
+variable "audit_webhook_enabled" {
+  description = "Habilita os flags --audit-policy-file/--audit-webhook-config-file do kube-apiserver em cada k3s server, apontando para o audit-webhook receiver do modules/security-monitoring. false por padrao: nenhum node-level change ocorre ate que o operador decida habilitar esta capability (mesmo principio de security_monitoring_enabled em platform/hetzner)."
+  type        = bool
+  default     = false
+}
+
+variable "audit_webhook_url" {
+  description = <<-EOT
+    URL completa (https://host:port/path) do audit-webhook receiver exposto pelo
+    Vector aggregator do modules/security-monitoring.
+
+    Opcional: o default ja resolve para o endereco interno do cluster
+    ("https://vector-aggregator.security-monitoring.svc.cluster.local:8443/"),
+    valido porque platform/hetzner/main.tf nunca sobrescreve os defaults
+    `namespace`/`audit_webhook_port` do modulo security-monitoring (sempre
+    "security-monitoring"/8443 — ver modules/security-monitoring/variables.tf).
+    So precisa ser setado explicitamente se isso deixar de ser verdade (ex.:
+    platform/hetzner passar a expor esses campos como tfvars).
+
+    CAVEAT DE ORDEM DE APPLY: este Service so existe depois que platform/hetzner
+    aplica (envs/hetzner sempre aplica primeiro). No bootstrap inicial de um
+    cluster novo, o kube-apiserver vai falhar silenciosamente ao entregar audit
+    events contra este endereco (webhook audit backends do Kubernetes sao
+    best-effort/nao-bloqueantes por padrao — a falha de entrega NAO impede o
+    apiserver de iniciar nem de atender requisicoes normais) at platform/hetzner
+    aplicar e o Service ficar alcancavel. E uma lacuna operacional de day-2, nao
+    uma mudanca de Terraform: nenhuma acao adicional e necessaria alem de aplicar
+    platform/hetzner na sequencia normal.
+  EOT
+  type        = string
+  default     = "https://vector-aggregator.security-monitoring.svc.cluster.local:8443/"
+}
+
 provider "hcloud" {
   token = var.hcloud_token
 }
@@ -126,6 +160,35 @@ resource "random_password" "k3s_token" {
 resource "hcloud_ssh_key" "default" {
   name       = "workerless-terraforms"
   public_key = file(pathexpand(var.ssh_public_key_path))
+}
+
+variable "placement_group_members" {
+  description = "Per-server opt-in. Keep false until an in-place association plan is explicitly reviewed."
+  type        = map(bool)
+  default = {
+    "k3s-hetzner-rock-0"   = false
+    "k3s-hetzner-rock-1"   = false
+    "k3s-hetzner-rock-2"   = false
+    "k3s-hetzner-worker-0" = false
+    "k3s-hetzner-worker-1" = false
+  }
+
+  validation {
+    condition = length(setsubtract(
+      keys(var.placement_group_members),
+      ["k3s-hetzner-rock-0", "k3s-hetzner-rock-1", "k3s-hetzner-rock-2", "k3s-hetzner-worker-0", "k3s-hetzner-worker-1"]
+    )) == 0
+    error_message = "placement_group_members accepts only the three control planes and two initial workers."
+  }
+}
+
+resource "hcloud_placement_group" "cluster_spread" {
+  name = "workerless-k3s-spread"
+  type = "spread"
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # Rede privada para tráfego inter-nó (etcd 2379-2380, kubelet 10250, flannel
@@ -161,20 +224,26 @@ resource "hcloud_firewall" "k3s" {
     description = "Kubernetes API"
   }
 
-  rule {
-    direction   = "in"
-    protocol    = "tcp"
-    port        = "6443"
-    source_ips  = var.control_plane_cidrs
-    description = "Kubernetes API - PaaS control-plane host (sem SSH)"
+  dynamic "rule" {
+    for_each = length(var.control_plane_cidrs) == 0 ? [] : [1]
+    content {
+      direction   = "in"
+      protocol    = "tcp"
+      port        = "6443"
+      source_ips  = var.control_plane_cidrs
+      description = "Kubernetes API - legacy PaaS control-plane access"
+    }
   }
 
-  rule {
-    direction   = "in"
-    protocol    = "tcp"
-    port        = tostring(var.prometheus_node_port)
-    source_ips  = var.control_plane_cidrs
-    description = "Prometheus NodePort - PaaS control-plane host"
+  dynamic "rule" {
+    for_each = var.prometheus_node_port == null || length(var.control_plane_cidrs) == 0 ? [] : [1]
+    content {
+      direction   = "in"
+      protocol    = "tcp"
+      port        = tostring(var.prometheus_node_port)
+      source_ips  = var.control_plane_cidrs
+      description = "Prometheus NodePort - legacy PaaS control-plane access"
+    }
   }
 
   rule {
@@ -222,6 +291,47 @@ resource "hcloud_firewall" "k3s" {
 # IPs privados deterministicos deixam os joiners apontarem para o bootstrap
 # dentro do proprio user_data, antes do bootstrap existir.
 locals {
+  # Minimal Kubernetes Audit policy: events excluded (noisy, low value);
+  # secrets/configmaps capped at Metadata level so request/response bodies
+  # (i.e. the secret values themselves) are never logged, per spec 3.2;
+  # everything else defaults to Metadata too — enough for the collector's
+  # purposes without an exhaustive, hand-tuned policy.
+  audit_policy_yaml = <<-POLICY
+    apiVersion: audit.k8s.io/v1
+    kind: Policy
+    rules:
+      - level: None
+        resources:
+          - group: ""
+            resources: ["events"]
+      - level: Metadata
+        resources:
+          - group: ""
+            resources: ["secrets", "configmaps"]
+      - level: Metadata
+  POLICY
+
+  # Webhook backend kubeconfig pointed at modules/security-monitoring's
+  # Vector aggregator audit-webhook Service. See var.audit_webhook_url for
+  # the apply-ordering caveat (envs/hetzner applies before platform/hetzner,
+  # so this address isn't reachable until the latter has applied).
+  audit_webhook_config_yaml = <<-WEBHOOK
+    apiVersion: v1
+    kind: Config
+    clusters:
+      - name: security-monitoring-audit
+        cluster:
+          server: ${var.audit_webhook_url}
+    contexts:
+      - context:
+          cluster: security-monitoring-audit
+          user: ""
+        name: webhook
+    current-context: webhook
+  WEBHOOK
+
+  audit_apiserver_args = var.audit_webhook_enabled ? " \\\n        --kube-apiserver-arg=audit-policy-file=/etc/rancher/k3s/audit-policy.yaml \\\n        --kube-apiserver-arg=audit-webhook-config-file=/etc/rancher/k3s/audit-webhook.yaml \\\n        --kube-apiserver-arg=audit-webhook-batch-max-wait=5s" : ""
+
   bootstrap_priv_ip = "10.10.1.2"
   joiner_priv_ips = {
     "1" = "10.10.1.3"
@@ -252,6 +362,20 @@ resource "hcloud_server" "bootstrap" {
   user_data = <<-EOF
     #!/bin/bash
     set -euxo pipefail
+    until ip link show enp7s0 >/dev/null 2>&1; do sleep 2; done
+    cat >/etc/systemd/network/20-workerless-private.network <<'NETWORK'
+    [Match]
+    Name=enp7s0
+
+    [Network]
+    DHCP=ipv4
+
+    [DHCPv4]
+    UseDNS=false
+    NETWORK
+    networkctl reload
+    ip link set dev enp7s0 up
+    networkctl reconfigure enp7s0
     until ip -4 addr show enp7s0 2>/dev/null | grep -q "${local.bootstrap_priv_ip}"; do sleep 2; done
     mkdir -p /etc/rancher/k3s
     cat >/etc/rancher/k3s/registries.yaml <<'REGISTRIES'
@@ -260,6 +384,14 @@ resource "hcloud_server" "bootstrap" {
         endpoint:
           - "http://10.43.100.100:5000"
     REGISTRIES
+    %{if var.audit_webhook_enabled}
+    cat >/etc/rancher/k3s/audit-policy.yaml <<'AUDITPOLICY'
+    ${local.audit_policy_yaml}
+    AUDITPOLICY
+    cat >/etc/rancher/k3s/audit-webhook.yaml <<'AUDITWEBHOOK'
+    ${local.audit_webhook_config_yaml}
+    AUDITWEBHOOK
+    %{endif}
     PUBLIC_IP=$(curl -s ifconfig.me)
     curl -sfL https://get.k3s.io | \
       INSTALL_K3S_VERSION=${var.k3s_version} \
@@ -273,12 +405,19 @@ resource "hcloud_server" "bootstrap" {
         --node-taint CriticalAddonsOnly=true:NoSchedule \
         --etcd-snapshot-schedule-cron '${var.etcd_snapshot_schedule_cron}' \
         --etcd-snapshot-retention ${var.etcd_snapshot_retention} \
-        --etcd-snapshot-dir /var/lib/rancher/k3s/server/db/snapshots
+        --etcd-snapshot-dir /var/lib/rancher/k3s/server/db/snapshots${local.audit_apiserver_args}
   EOF
 
   depends_on = [
     hcloud_network_subnet.private,
   ]
+
+  # user_data only runs on first boot. Replacing control-plane nodes
+  # automatically when this script changes can take down etcd quorum; roll
+  # such changes out explicitly, one node at a time, with -replace.
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
 resource "null_resource" "wait_for_bootstrap" {
@@ -289,25 +428,28 @@ resource "null_resource" "wait_for_bootstrap" {
   }
 
   connection {
-    type        = "ssh"
-    user        = "root"
-    host        = hcloud_server.bootstrap.ipv4_address
-    private_key = file(pathexpand(var.ssh_private_key_path))
-    timeout     = "10m"
+    type    = "ssh"
+    user    = "root"
+    host    = hcloud_server.bootstrap.ipv4_address
+    agent   = true
+    timeout = "10m"
   }
 
   provisioner "remote-exec" {
     inline = [
-      "until [ -f /etc/rancher/k3s/k3s.yaml ] && systemctl is-active --quiet k3s; do echo 'waiting for k3s bootstrap...'; sleep 5; done",
-      "until kubectl get nodes 2>/dev/null | grep -q ' Ready '; do echo 'waiting for bootstrap Ready...'; sleep 5; done",
+      "timeout 10m sh -c 'until [ -f /etc/rancher/k3s/k3s.yaml ] && systemctl is-active --quiet k3s; do echo \"waiting for k3s bootstrap...\"; sleep 5; done'",
+      "timeout 10m sh -c 'until kubectl get node k3s-hetzner-rock-0 --no-headers 2>/dev/null | grep -q \" Ready \"; do echo \"waiting for bootstrap Ready...\"; sleep 5; done'",
     ]
   }
 }
 
-resource "hcloud_server" "joiners" {
-  for_each = local.joiner_priv_ips
+moved {
+  from = hcloud_server.joiners["1"]
+  to   = hcloud_server.joiner_1
+}
 
-  name         = "k3s-hetzner-rock-${each.key}"
+resource "hcloud_server" "joiner_1" {
+  name         = "k3s-hetzner-rock-1"
   image        = "ubuntu-22.04"
   server_type  = var.server_type
   location     = var.server_location
@@ -316,13 +458,27 @@ resource "hcloud_server" "joiners" {
 
   network {
     network_id = hcloud_network.private.id
-    ip         = each.value
+    ip         = local.joiner_priv_ips["1"]
   }
 
   user_data = <<-EOF
     #!/bin/bash
     set -euxo pipefail
-    until ip -4 addr show enp7s0 2>/dev/null | grep -q "${each.value}"; do sleep 2; done
+    until ip link show enp7s0 >/dev/null 2>&1; do sleep 2; done
+    cat >/etc/systemd/network/20-workerless-private.network <<'NETWORK'
+    [Match]
+    Name=enp7s0
+
+    [Network]
+    DHCP=ipv4
+
+    [DHCPv4]
+    UseDNS=false
+    NETWORK
+    networkctl reload
+    ip link set dev enp7s0 up
+    networkctl reconfigure enp7s0
+    until ip -4 addr show enp7s0 2>/dev/null | grep -q "${local.joiner_priv_ips["1"]}"; do sleep 2; done
     mkdir -p /etc/rancher/k3s
     cat >/etc/rancher/k3s/registries.yaml <<'REGISTRIES'
     mirrors:
@@ -330,6 +486,14 @@ resource "hcloud_server" "joiners" {
         endpoint:
           - "http://10.43.100.100:5000"
     REGISTRIES
+    %{if var.audit_webhook_enabled}
+    cat >/etc/rancher/k3s/audit-policy.yaml <<'AUDITPOLICY'
+    ${local.audit_policy_yaml}
+    AUDITPOLICY
+    cat >/etc/rancher/k3s/audit-webhook.yaml <<'AUDITWEBHOOK'
+    ${local.audit_webhook_config_yaml}
+    AUDITWEBHOOK
+    %{endif}
     PUBLIC_IP=$(curl -s ifconfig.me)
     curl -sfL https://get.k3s.io | \
       INSTALL_K3S_VERSION=${var.k3s_version} \
@@ -337,19 +501,123 @@ resource "hcloud_server" "joiners" {
       sh -s - server \
         --server https://${local.bootstrap_priv_ip}:6443 \
         --tls-san $PUBLIC_IP \
-        --node-ip ${each.value} \
-        --advertise-address ${each.value} \
+        --node-ip ${local.joiner_priv_ips["1"]} \
+        --advertise-address ${local.joiner_priv_ips["1"]} \
         --flannel-iface enp7s0 \
         --node-taint CriticalAddonsOnly=true:NoSchedule \
         --etcd-snapshot-schedule-cron '${var.etcd_snapshot_schedule_cron}' \
         --etcd-snapshot-retention ${var.etcd_snapshot_retention} \
-        --etcd-snapshot-dir /var/lib/rancher/k3s/server/db/snapshots
+        --etcd-snapshot-dir /var/lib/rancher/k3s/server/db/snapshots${local.audit_apiserver_args}
   EOF
 
   depends_on = [
     hcloud_network_subnet.private,
     null_resource.wait_for_bootstrap,
   ]
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
+}
+
+resource "null_resource" "wait_for_joiner_1" {
+  depends_on = [hcloud_server.joiner_1]
+
+  triggers = {
+    bootstrap_id = hcloud_server.bootstrap.id
+    joiner_id    = hcloud_server.joiner_1.id
+  }
+
+  connection {
+    type    = "ssh"
+    user    = "root"
+    host    = hcloud_server.bootstrap.ipv4_address
+    agent   = true
+    timeout = "10m"
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "timeout 10m sh -c 'until kubectl get node k3s-hetzner-rock-1 --no-headers 2>/dev/null | grep -q \" Ready \"; do echo \"waiting for first joiner Ready...\"; sleep 5; done'",
+    ]
+  }
+}
+
+moved {
+  from = hcloud_server.joiners["2"]
+  to   = hcloud_server.joiner_2
+}
+
+resource "hcloud_server" "joiner_2" {
+  name         = "k3s-hetzner-rock-2"
+  image        = "ubuntu-22.04"
+  server_type  = var.server_type
+  location     = var.server_location
+  ssh_keys     = [hcloud_ssh_key.default.id]
+  firewall_ids = [hcloud_firewall.k3s.id]
+
+  network {
+    network_id = hcloud_network.private.id
+    ip         = local.joiner_priv_ips["2"]
+  }
+
+  user_data = <<-EOF
+    #!/bin/bash
+    set -euxo pipefail
+    until ip link show enp7s0 >/dev/null 2>&1; do sleep 2; done
+    cat >/etc/systemd/network/20-workerless-private.network <<'NETWORK'
+    [Match]
+    Name=enp7s0
+
+    [Network]
+    DHCP=ipv4
+
+    [DHCPv4]
+    UseDNS=false
+    NETWORK
+    networkctl reload
+    ip link set dev enp7s0 up
+    networkctl reconfigure enp7s0
+    until ip -4 addr show enp7s0 2>/dev/null | grep -q "${local.joiner_priv_ips["2"]}"; do sleep 2; done
+    mkdir -p /etc/rancher/k3s
+    cat >/etc/rancher/k3s/registries.yaml <<'REGISTRIES'
+    mirrors:
+      "10.43.100.100:5000":
+        endpoint:
+          - "http://10.43.100.100:5000"
+    REGISTRIES
+    %{if var.audit_webhook_enabled}
+    cat >/etc/rancher/k3s/audit-policy.yaml <<'AUDITPOLICY'
+    ${local.audit_policy_yaml}
+    AUDITPOLICY
+    cat >/etc/rancher/k3s/audit-webhook.yaml <<'AUDITWEBHOOK'
+    ${local.audit_webhook_config_yaml}
+    AUDITWEBHOOK
+    %{endif}
+    PUBLIC_IP=$(curl -s ifconfig.me)
+    curl -sfL https://get.k3s.io | \
+      INSTALL_K3S_VERSION=${var.k3s_version} \
+      K3S_TOKEN='${random_password.k3s_token.result}' \
+      sh -s - server \
+        --server https://${local.bootstrap_priv_ip}:6443 \
+        --tls-san $PUBLIC_IP \
+        --node-ip ${local.joiner_priv_ips["2"]} \
+        --advertise-address ${local.joiner_priv_ips["2"]} \
+        --flannel-iface enp7s0 \
+        --node-taint CriticalAddonsOnly=true:NoSchedule \
+        --etcd-snapshot-schedule-cron '${var.etcd_snapshot_schedule_cron}' \
+        --etcd-snapshot-retention ${var.etcd_snapshot_retention} \
+        --etcd-snapshot-dir /var/lib/rancher/k3s/server/db/snapshots${local.audit_apiserver_args}
+  EOF
+
+  depends_on = [
+    hcloud_network_subnet.private,
+    null_resource.wait_for_joiner_1,
+  ]
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
 resource "hcloud_server" "workers" {
@@ -370,6 +638,20 @@ resource "hcloud_server" "workers" {
   user_data = <<-EOF
     #!/bin/bash
     set -euxo pipefail
+    until ip link show enp7s0 >/dev/null 2>&1; do sleep 2; done
+    cat >/etc/systemd/network/20-workerless-private.network <<'NETWORK'
+    [Match]
+    Name=enp7s0
+
+    [Network]
+    DHCP=ipv4
+
+    [DHCPv4]
+    UseDNS=false
+    NETWORK
+    networkctl reload
+    ip link set dev enp7s0 up
+    networkctl reconfigure enp7s0
     until ip -4 addr show enp7s0 2>/dev/null | grep -q "${each.value}"; do sleep 2; done
     mkdir -p /etc/rancher/k3s
     cat >/etc/rancher/k3s/registries.yaml <<'REGISTRIES'
@@ -392,6 +674,10 @@ resource "hcloud_server" "workers" {
     hcloud_network_subnet.private,
     null_resource.wait_for_cluster,
   ]
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 }
 
 resource "null_resource" "wait_for_workers" {
@@ -404,40 +690,57 @@ resource "null_resource" "wait_for_workers" {
   }
 
   connection {
-    type        = "ssh"
-    user        = "root"
-    host        = hcloud_server.bootstrap.ipv4_address
-    private_key = file(pathexpand(var.ssh_private_key_path))
-    timeout     = "10m"
+    type    = "ssh"
+    user    = "root"
+    host    = hcloud_server.bootstrap.ipv4_address
+    agent   = true
+    timeout = "10m"
   }
 
   provisioner "remote-exec" {
     inline = [
-      "until [ $(kubectl get nodes --no-headers 2>/dev/null | grep -c ' Ready ') -ge ${local.expected_node_count} ]; do echo 'waiting for ${local.expected_node_count} nodes Ready...'; sleep 5; done",
+      "timeout 10m sh -c 'until [ $(kubectl get nodes --no-headers 2>/dev/null | grep -c \" Ready \") -ge ${local.expected_node_count} ]; do echo \"waiting for ${local.expected_node_count} nodes Ready...\"; sleep 5; done'",
     ]
   }
 }
 
+locals {
+  placement_group_server_ids = merge(
+    {
+      "k3s-hetzner-rock-0" = hcloud_server.bootstrap.id
+      "k3s-hetzner-rock-1" = hcloud_server.joiner_1.id
+      "k3s-hetzner-rock-2" = hcloud_server.joiner_2.id
+    },
+    {
+      for key, worker in hcloud_server.workers : "k3s-hetzner-worker-${key}" => worker.id
+    }
+  )
+  enabled_placement_group_members = {
+    for name, enabled in var.placement_group_members : name => local.placement_group_server_ids[name]
+    if enabled
+  }
+}
+
 resource "null_resource" "wait_for_cluster" {
-  depends_on = [hcloud_server.joiners]
+  depends_on = [hcloud_server.joiner_2]
 
   triggers = {
     bootstrap_id          = hcloud_server.bootstrap.id
     expected_server_count = local.expected_server_count
-    joiner_ids            = join(",", [for s in hcloud_server.joiners : s.id])
+    joiner_ids            = join(",", [hcloud_server.joiner_1.id, hcloud_server.joiner_2.id])
   }
 
   connection {
-    type        = "ssh"
-    user        = "root"
-    host        = hcloud_server.bootstrap.ipv4_address
-    private_key = file(pathexpand(var.ssh_private_key_path))
-    timeout     = "10m"
+    type    = "ssh"
+    user    = "root"
+    host    = hcloud_server.bootstrap.ipv4_address
+    agent   = true
+    timeout = "10m"
   }
 
   provisioner "remote-exec" {
     inline = [
-      "until [ $(kubectl get nodes --no-headers 2>/dev/null | grep -c ' Ready ') -ge ${local.expected_server_count} ]; do echo 'waiting for ${local.expected_server_count} nodes Ready...'; sleep 5; done",
+      "timeout 10m sh -c 'until [ $(kubectl get nodes --no-headers 2>/dev/null | grep -c \" Ready \") -ge ${local.expected_server_count} ]; do echo \"waiting for ${local.expected_server_count} server nodes Ready...\"; sleep 5; done'",
     ]
   }
 }
@@ -452,8 +755,8 @@ data "external" "kubeconfig" {
   ]
 
   program = ["bash", "-c", <<-EOT
+    set -euo pipefail
     KCFG=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -i ${pathexpand(var.ssh_private_key_path)} \
       root@${hcloud_server.bootstrap.ipv4_address} "cat /etc/rancher/k3s/k3s.yaml" \
       | sed "s|https://127.0.0.1:6443|https://${hcloud_server.bootstrap.ipv4_address}:6443|")
     jq -nc --arg cfg "$KCFG" '{kubeconfig:$cfg}'
@@ -469,7 +772,7 @@ output "server_ipv4s" {
   description = "IPs publicos dos servers k3s (bootstrap + joiners)"
   value = concat(
     [hcloud_server.bootstrap.ipv4_address],
-    [for s in hcloud_server.joiners : s.ipv4_address],
+    [hcloud_server.joiner_1.ipv4_address, hcloud_server.joiner_2.ipv4_address],
   )
 }
 
@@ -491,6 +794,14 @@ output "worker_ipv4s" {
 output "network_id" {
   description = "ID da rede privada (10.10.0.0/16) para uso por workloads que precisem ingressar nela"
   value       = hcloud_network.private.id
+}
+
+output "placement_group_association_plan" {
+  description = "Explicit server IDs selected for operator-run in-place association. The provider has no assignment resource; this output never mutates servers."
+  value = {
+    placement_group_id = hcloud_placement_group.cluster_spread.id
+    servers            = local.enabled_placement_group_members
+  }
 }
 
 output "kube_host" {

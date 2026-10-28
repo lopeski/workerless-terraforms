@@ -15,6 +15,77 @@
 # valor em envs/local/terraform.tfvars se sobrescrito. O output
 # `prometheus_url` (http://localhost:<porta>) é o valor a usar em
 # OBSERVABILITY_PROMETHEUS_URL no workerless-api.
+#
+# Workerless Security Guard (security-guard-grpc, tailscale-operator,
+# cloudflare-operational-blocking, security-evidence-r2,
+# security-datastore-acl, security-monitoring): todas as flags *_enabled
+# abaixo já vêm `false` por default no próprio main.tf — não é necessário
+# declarar nada aqui para manter o perfil local atual (sem Tailscale,
+# Cloudflare, R2 ou DB/Kafka reais, sem credenciais placeholder). Descomente
+# e preencha o bloco abaixo apenas se quiser exercitar alguma dessas
+# capabilities localmente contra serviços reais/sandbox.
+
+# is_production = false # local nunca arma as validações de produção
+
+# security_guard_grpc_enabled           = true
+# guard_grpc_image                      = "ghcr.io/workerless/security-guard-grpc:CHANGE_ME"
+# guard_grpc_tailnet_hostname           = "guard-grpc.CHANGE_ME.ts.net"
+# guard_grpc_db_egress_cidr             = "203.0.113.50/32"
+# guard_grpc_db_credentials_secret_ref = {
+#   secret_store_name = "dev-secrets"
+#   secret_store_kind = "ClusterSecretStore"
+# }
+
+# tailscale_operator_enabled       = true
+# tailscale_tf_oauth_client_id     = "CHANGE_ME"   # export via TF_VAR_tailscale_tf_oauth_client_id
+# tailscale_tf_oauth_client_secret = "CHANGE_ME"   # export via TF_VAR_tailscale_tf_oauth_client_secret
+# tailscale_operator_tag           = "tag:guard-operator"
+# tailscale_proxy_tag              = "tag:guard-proxy"
+# tailscale_allowed_device_tags    = ["tag:guard-admin-mac"]
+# tailscale_oauth_secret_ref = {
+#   secret_store_name = "dev-secrets"
+#   secret_store_kind = "ClusterSecretStore"
+# }
+
+# cloudflare_operational_blocking_enabled = true
+# cloudflare_waf_api_token                = "CHANGE_ME" # export via TF_VAR_cloudflare_waf_api_token
+# cloudflare_account_id                   = "CHANGE_ME"
+# cloudflare_zone_ids                     = ["CHANGE_ME"]
+# cloudflare_guard_list_name              = "workerless_guard_block_local"
+# cloudflare_guard_rule_expression        = "(ip.src in $workerless_guard_block_local)"
+# cloudflare_protected_endpoints          = ["guard-api.example.com"]
+# cloudflare_guard_token_backend_key      = "cloudflare-guard-runtime-token"
+# cloudflare_guard_token_secret_ref = {
+#   secret_store_name = "dev-secrets"
+#   secret_store_kind = "ClusterSecretStore"
+# }
+
+# r2_evidence_enabled      = true
+# cloudflare_r2_api_token  = "CHANGE_ME" # export via TF_VAR_cloudflare_r2_api_token
+# r2_evidence_bucket_name  = "workerless-guard-evidence-local"
+# r2_evidence_token_secret_ref = {
+#   secret_store_name = "dev-secrets"
+#   secret_store_kind = "ClusterSecretStore"
+# }
+
+# security_datastore_acl_enabled = true
+# postgresql_host                 = "127.0.0.1"
+# postgresql_database             = "security"
+# postgresql_security_tables      = ["events", "alerts"]
+# postgresql_admin_credentials_secret_ref = { username = "CHANGE_ME", password = "CHANGE_ME" }
+# kafka_bootstrap_servers         = ["127.0.0.1:9092"]
+# kafka_api_principal             = "User:security-guard-api"
+# kafka_collector_principal       = "User:security-collector"
+
+# security_monitoring_enabled = true
+# falco_image_digest          = "CHANGE_ME_64_HEX_SHA256_DIGEST"
+# audit_ingestion_allowed_cidr = "10.10.1.0/24"
+# collector_image              = "ghcr.io/workerless/security-collector:CHANGE_ME"
+# collector_watched_resources = [
+#   { api_groups = [""],     resources = ["pods"],        verbs = ["get", "list", "watch"] },
+#   { api_groups = ["apps"], resources = ["deployments"], verbs = ["get", "list", "watch"] },
+#   { api_groups = [""],     resources = ["events"],      verbs = ["get", "list", "watch"] },
+# ]
 
 plans = {
   starter = {

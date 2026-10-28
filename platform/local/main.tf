@@ -4,6 +4,10 @@ terraform {
     kubernetes = { source = "hashicorp/kubernetes", version = "~> 2.30" }
     kubectl    = { source = "gavinbunney/kubectl", version = ">= 1.14.0" }
     time       = { source = "hashicorp/time", version = "~> 0.11" }
+    cloudflare = { source = "cloudflare/cloudflare", version = "~> 5.27" }
+    tailscale  = { source = "tailscale/tailscale", version = "~> 0.29" }
+    postgresql = { source = "cyrilgdn/postgresql", version = "~> 1.27" }
+    kafka      = { source = "Mongey/kafka", version = "~> 0.13" }
   }
 }
 
@@ -155,6 +159,385 @@ locals {
   }
 }
 
+# -------------------------------------------------------------------------
+# Workerless Security Guard — flag-gated modules. Every *_enabled below
+# defaults to false: local dev never creates fake resources or placeholder
+# credentials for these capabilities (spec §12). See
+# terraform.tfvars.example for the staging/production profile notes.
+#
+# modules/cloudflare-operational-blocking, modules/security-evidence-r2,
+# modules/tailscale-operator, and modules/security-datastore-acl all
+# declare their own provider configuration here at the root — none of them
+# contain an internal `provider` block, because Terraform refuses to call a
+# module with its own provider configuration using count/for_each/depends_on.
+# See each module's README "Provider wiring" section for the exact contract.
+# -------------------------------------------------------------------------
+
+variable "is_production" {
+  description = "Arms the production-only validations across the Security Guard modules (ProxyGroup HA, R2 retention floor, ...). Always false for platform/local."
+  type        = bool
+  default     = false
+}
+
+variable "security_guard_grpc_enabled" {
+  type    = bool
+  default = false
+}
+
+variable "guard_grpc_image" {
+  type        = string
+  default     = null
+  description = "Container image for the Security Guard gRPC admin API. Required when security_guard_grpc_enabled."
+}
+
+variable "guard_grpc_port" {
+  description = "TCP port the gRPC admin API listens on. Shared literal between modules.security_guard_grpc and modules.tailscale_operator — keep both in sync if ever changed."
+  type        = number
+  default     = 8443
+}
+
+variable "guard_grpc_replicas" {
+  type    = number
+  default = 2
+}
+
+variable "guard_grpc_tailnet_hostname" {
+  description = "Tailscale MagicDNS hostname the gRPC server certificate SAN must cover. Must stay in sync with how the Tailscale Operator actually names the forwarding Service — see modules/tailscale-operator/README.md. Required when security_guard_grpc_enabled."
+  type        = string
+  default     = null
+}
+
+variable "guard_grpc_db_credentials_secret_ref" {
+  type = object({
+    secret_store_name = string
+    secret_store_kind = string
+  })
+  default     = null
+  description = "ExternalSecret pointer for the gRPC API's read-only security-database credentials. Required when security_guard_grpc_enabled."
+}
+
+variable "guard_grpc_db_egress_cidr" {
+  type        = string
+  default     = null
+  description = "CIDR of the security database the gRPC API reads from. Required when security_guard_grpc_enabled; never 0.0.0.0/0."
+}
+
+variable "guard_grpc_db_egress_port" {
+  type    = number
+  default = 5432
+}
+
+variable "guard_grpc_authorized_egress_rules" {
+  type = list(object({
+    cidr = string
+    ports = list(object({
+      port     = number
+      protocol = optional(string, "TCP")
+    }))
+  }))
+  default = []
+}
+
+variable "tailscale_operator_enabled" {
+  type    = bool
+  default = false
+}
+
+# Terraform-PROVIDER-level credential: the Terraform process itself
+# authenticates to the Tailscale API to own the full tailnet ACL
+# (tailscale_acl). Sourced like hcloud_token (TF_VAR_*/CI secret), never via
+# ExternalSecrets — distinct from tailscale_oauth_secret_ref below, which is
+# the IN-CLUSTER Operator's own credential.
+variable "tailscale_tf_oauth_client_id" {
+  type      = string
+  sensitive = true
+  default   = null
+}
+
+variable "tailscale_tf_oauth_client_secret" {
+  type      = string
+  sensitive = true
+  default   = null
+}
+
+variable "tailscale_tailnet" {
+  description = "Tailnet the Terraform provider manages. \"-\" resolves to whichever tailnet owns the OAuth client credentials."
+  type        = string
+  default     = "-"
+}
+
+variable "tailscale_oauth_secret_ref" {
+  type = object({
+    secret_store_name = string
+    secret_store_kind = string
+  })
+  default     = null
+  description = "ExternalSecret pointer for the in-cluster Tailscale Operator's own OAuth client. Required when tailscale_operator_enabled."
+}
+
+variable "tailscale_operator_tag" {
+  type        = string
+  default     = null
+  description = "Tailnet tag for the Operator's own device identity, e.g. tag:guard-operator. Required when tailscale_operator_enabled."
+}
+
+variable "tailscale_proxy_tag" {
+  type        = string
+  default     = null
+  description = "Tailnet tag for ProxyGroup proxy devices, e.g. tag:guard-proxy. Required when tailscale_operator_enabled."
+}
+
+variable "tailscale_allowed_device_tags" {
+  type        = list(string)
+  default     = []
+  description = "Tailnet tags of personally-authorized devices allowed to reach the gRPC proxy tag. Required (non-empty) when tailscale_operator_enabled."
+}
+
+variable "tailscale_hostname_override" {
+  type    = string
+  default = null
+}
+
+variable "proxy_group_replicas" {
+  type    = number
+  default = 2
+}
+
+variable "cloudflare_operational_blocking_enabled" {
+  type    = bool
+  default = false
+}
+
+variable "r2_evidence_enabled" {
+  type    = bool
+  default = false
+}
+
+# Shared Cloudflare account between the WAF-blocking and R2-evidence modules
+# — they use two DISTINCT API tokens against the same account.
+variable "cloudflare_account_id" {
+  type    = string
+  default = null
+}
+
+variable "cloudflare_waf_api_token" {
+  description = "Terraform-operator bootstrap credential for modules.cloudflare_operational_blocking (broad enough to manage Rulesets+Lists). Distinct from cloudflare_r2_api_token."
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+variable "cloudflare_r2_api_token" {
+  description = "Terraform-operator bootstrap credential for modules.security_evidence_r2 (broad enough to manage the R2 bucket/lock/lifecycle). Distinct from cloudflare_waf_api_token."
+  type        = string
+  sensitive   = true
+  default     = null
+}
+
+variable "cloudflare_zone_ids" {
+  type    = list(string)
+  default = []
+}
+
+variable "cloudflare_guard_list_name" {
+  type    = string
+  default = null
+}
+
+variable "cloudflare_guard_rule_expression" {
+  type    = string
+  default = null
+}
+
+variable "cloudflare_protected_endpoints" {
+  type    = list(string)
+  default = []
+}
+
+variable "cloudflare_guard_token_secret_ref" {
+  type = object({
+    secret_store_name = string
+    secret_store_kind = string
+  })
+  default = null
+}
+
+variable "guard_token_secret_namespace" {
+  type    = string
+  default = "security-guard-grpc"
+}
+
+variable "cloudflare_guard_token_backend_key" {
+  type    = string
+  default = null
+}
+
+variable "r2_evidence_bucket_name" {
+  type    = string
+  default = null
+}
+
+variable "r2_evidence_retention_days" {
+  type    = number
+  default = 365
+}
+
+variable "r2_evidence_token_secret_ref" {
+  type = object({
+    secret_store_name = string
+    secret_store_kind = string
+  })
+  default = null
+}
+
+variable "security_datastore_acl_enabled" {
+  type    = bool
+  default = false
+}
+
+# Live-connection bootstrap variables — NOT ExternalSecret pointers. The
+# postgresql/kafka Terraform providers connect at plan/apply time, so these
+# must be TF_VAR_*/CI-sourced like hcloud_token. Safe null/empty defaults so
+# the always-initialized root provider blocks below don't break
+# terraform plan when security_datastore_acl_enabled = false.
+variable "postgresql_host" {
+  type    = string
+  default = null
+}
+
+variable "postgresql_port" {
+  type    = number
+  default = 5432
+}
+
+variable "postgresql_database" {
+  type    = string
+  default = null
+}
+
+variable "postgresql_admin_credentials_secret_ref" {
+  type = object({
+    username = string
+    password = string
+  })
+  sensitive = true
+  default   = null
+}
+
+variable "postgresql_security_schema" {
+  type    = string
+  default = "security"
+}
+
+variable "postgresql_security_tables" {
+  type    = list(string)
+  default = []
+}
+
+variable "postgresql_schema_owner_role" {
+  type    = string
+  default = null
+}
+
+variable "kafka_bootstrap_servers" {
+  type    = list(string)
+  default = []
+}
+
+variable "kafka_admin_credentials_secret_ref" {
+  type = object({
+    username = string
+    password = string
+  })
+  sensitive = true
+  default   = null
+}
+
+variable "kafka_security_topics" {
+  type = map(object({
+    partitions         = number
+    replication_factor = number
+    retention_ms       = number
+  }))
+  default = {}
+}
+
+variable "kafka_dlq_topic_name" {
+  type    = string
+  default = "security-guard-dlq"
+}
+
+variable "kafka_dlq_retention_ms" {
+  type    = number
+  default = 604800000
+}
+
+variable "kafka_api_principal" {
+  type    = string
+  default = null
+}
+
+variable "kafka_collector_principal" {
+  type    = string
+  default = null
+}
+
+variable "kafka_dlq_ops_principal" {
+  type    = string
+  default = null
+}
+
+variable "security_monitoring_enabled" {
+  type    = bool
+  default = false
+}
+
+variable "falco_image_digest" {
+  type        = string
+  default     = null
+  description = "sha256 digest (hex only, no prefix) of the Falco image to pin. Required when security_monitoring_enabled."
+}
+
+variable "audit_ingestion_allowed_cidr" {
+  type        = string
+  default     = null
+  description = "CIDR of the k3s control-plane nodes allowed to reach the audit webhook receiver. Required when security_monitoring_enabled; never 0.0.0.0/0."
+}
+
+variable "collector_image" {
+  type    = string
+  default = null
+}
+
+variable "collector_replicas" {
+  type    = number
+  default = 1
+}
+
+variable "collector_watched_resources" {
+  description = "Explicit allow-list of resources the security collector's RBAC may get/list/watch. Required when security_monitoring_enabled; see terraform.tfvars.example for a starting-point list. Never includes secrets or wildcards (enforced by the module's own validation)."
+  type = list(object({
+    api_groups = list(string)
+    resources  = list(string)
+    verbs      = list(string)
+  }))
+  default = []
+}
+
+variable "security_monitoring_kafka_bootstrap_servers" {
+  description = "Kafka bootstrap servers for the Vector aggregator's sink. Distinct variable from kafka_bootstrap_servers (security-datastore-acl's connection target) even if pointed at the same cluster."
+  type        = list(string)
+  default     = []
+}
+
+variable "vector_kafka_credentials_secret_ref" {
+  type = object({
+    secret_store_name = string
+    secret_store_kind = string
+  })
+  default = null
+}
+
 provider "helm" {
   kubernetes {
     config_path    = var.kubeconfig_path
@@ -170,6 +553,48 @@ provider "kubectl" {
 provider "kubernetes" {
   config_path    = var.kubeconfig_path
   config_context = var.kube_context
+}
+
+# Security Guard: root-level provider configuration for the 4 modules that
+# cannot declare their own provider block (see the variables section above
+# for why). Each stays safely uninitialized-but-valid when its *_enabled
+# flag is false — nothing attempts a live connection unless the gated
+# module/resources are actually instantiated.
+provider "cloudflare" {
+  alias     = "ops_blocking"
+  api_token = var.cloudflare_waf_api_token
+}
+
+provider "cloudflare" {
+  alias     = "r2_evidence"
+  api_token = var.cloudflare_r2_api_token
+}
+
+provider "tailscale" {
+  oauth_client_id     = var.tailscale_tf_oauth_client_id
+  oauth_client_secret = var.tailscale_tf_oauth_client_secret
+  tailnet             = var.tailscale_tailnet
+}
+
+provider "postgresql" {
+  alias           = "security_datastore"
+  host            = var.postgresql_host
+  port            = var.postgresql_port
+  database        = var.postgresql_database
+  username        = try(var.postgresql_admin_credentials_secret_ref.username, null)
+  password        = try(var.postgresql_admin_credentials_secret_ref.password, null)
+  sslmode         = "verify-full"
+  connect_timeout = 10
+  superuser       = false
+}
+
+provider "kafka" {
+  alias             = "security_datastore"
+  bootstrap_servers = var.kafka_bootstrap_servers
+  sasl_mechanism    = "scram-sha256"
+  sasl_username     = try(var.kafka_admin_credentials_secret_ref.username, null)
+  sasl_password     = try(var.kafka_admin_credentials_secret_ref.password, null)
+  tls_enabled       = true
 }
 
 module "core_platform" {
@@ -342,6 +767,120 @@ module "workload" {
   metrics                          = each.value.metrics
 }
 
+# -------------------------------------------------------------------------
+# Workerless Security Guard modules — each gated by its own *_enabled flag.
+# count = 0 / for_each = {} by default: nothing is created, no live
+# connection to Cloudflare/Tailscale/Postgres/Kafka is ever attempted.
+# -------------------------------------------------------------------------
+
+module "security_guard_grpc" {
+  count      = var.security_guard_grpc_enabled ? 1 : 0
+  source     = "../../modules/security-guard-grpc"
+  depends_on = [module.core_platform]
+
+  guard_grpc_image          = var.guard_grpc_image
+  guard_grpc_port           = var.guard_grpc_port
+  guard_grpc_replicas       = var.guard_grpc_replicas
+  tailnet_hostname          = var.guard_grpc_tailnet_hostname
+  db_credentials_secret_ref = var.guard_grpc_db_credentials_secret_ref
+  db_egress_cidr            = var.guard_grpc_db_egress_cidr
+  db_egress_port            = var.guard_grpc_db_egress_port
+  authorized_egress_rules   = var.guard_grpc_authorized_egress_rules
+}
+
+module "tailscale_operator" {
+  count      = var.tailscale_operator_enabled ? 1 : 0
+  source     = "../../modules/tailscale-operator"
+  depends_on = [module.core_platform, module.security_guard_grpc]
+
+  tailscale_oauth_secret_ref    = var.tailscale_oauth_secret_ref
+  tailscale_operator_tag        = var.tailscale_operator_tag
+  tailscale_proxy_tag           = var.tailscale_proxy_tag
+  tailscale_allowed_device_tags = var.tailscale_allowed_device_tags
+  guard_grpc_port               = var.guard_grpc_port
+  tailscale_hostname_override   = var.tailscale_hostname_override
+  proxy_group_replicas          = var.proxy_group_replicas
+  is_production                 = var.is_production
+}
+
+module "cloudflare_operational_blocking" {
+  count  = var.cloudflare_operational_blocking_enabled ? 1 : 0
+  source = "../../modules/cloudflare-operational-blocking"
+
+  providers = {
+    cloudflare = cloudflare.ops_blocking
+  }
+
+  cloudflare_account_id             = var.cloudflare_account_id
+  cloudflare_zone_ids               = var.cloudflare_zone_ids
+  cloudflare_guard_list_name        = var.cloudflare_guard_list_name
+  cloudflare_guard_rule_expression  = var.cloudflare_guard_rule_expression
+  protected_endpoints               = var.cloudflare_protected_endpoints
+  cloudflare_guard_token_secret_ref = var.cloudflare_guard_token_secret_ref
+  guard_token_secret_namespace      = var.guard_token_secret_namespace
+  guard_token_backend_key           = var.cloudflare_guard_token_backend_key
+}
+
+module "security_evidence_r2" {
+  count  = var.r2_evidence_enabled ? 1 : 0
+  source = "../../modules/security-evidence-r2"
+
+  providers = {
+    cloudflare = cloudflare.r2_evidence
+  }
+
+  cloudflare_account_id        = var.cloudflare_account_id
+  r2_evidence_bucket_name      = var.r2_evidence_bucket_name
+  r2_evidence_retention_days   = var.r2_evidence_retention_days
+  r2_evidence_token_secret_ref = var.r2_evidence_token_secret_ref
+  is_production                = var.is_production
+}
+
+module "security_datastore_acl" {
+  for_each = var.security_datastore_acl_enabled ? { enabled = true } : {}
+  source   = "../../modules/security-datastore-acl"
+
+  providers = {
+    postgresql = postgresql.security_datastore
+    kafka      = kafka.security_datastore
+  }
+
+  security_datastore_acl_enabled = true
+  postgresql_database            = var.postgresql_database
+  postgresql_security_schema     = var.postgresql_security_schema
+  postgresql_security_tables     = var.postgresql_security_tables
+  postgresql_schema_owner_role   = var.postgresql_schema_owner_role
+  kafka_security_topics          = var.kafka_security_topics
+  kafka_dlq_topic_name           = var.kafka_dlq_topic_name
+  kafka_dlq_retention_ms         = var.kafka_dlq_retention_ms
+  kafka_api_principal            = var.kafka_api_principal
+  kafka_collector_principal      = var.kafka_collector_principal
+  kafka_dlq_ops_principal        = var.kafka_dlq_ops_principal
+}
+
+module "security_monitoring" {
+  count      = var.security_monitoring_enabled ? 1 : 0
+  source     = "../../modules/security-monitoring"
+  depends_on = [module.core_platform]
+
+  falco_image_digest                  = var.falco_image_digest
+  audit_ingestion_allowed_cidr        = var.audit_ingestion_allowed_cidr
+  collector_image                     = var.collector_image
+  collector_replicas                  = var.collector_replicas
+  collector_watched_resources         = var.collector_watched_resources
+  kafka_security_bootstrap_servers    = var.security_monitoring_kafka_bootstrap_servers
+  vector_kafka_credentials_secret_ref = var.vector_kafka_credentials_secret_ref
+}
+
+# A ProxyGroup with no backing Service is a misconfiguration — catch it at
+# plan time rather than leaving a dangling Tailscale exposure.
+check "tailscale_requires_guard_grpc" {
+  assert {
+    condition     = !var.tailscale_operator_enabled || var.security_guard_grpc_enabled
+    error_message = "tailscale_operator_enabled requires security_guard_grpc_enabled (the ProxyGroup would have no backing Service)."
+  }
+}
+
 output "paas_sa_token" {
   description = "DEPRECATED: use workerless_api_token."
   value       = module.core_platform.paas_sa_token
@@ -384,4 +923,63 @@ output "registry_internal_endpoint" {
 output "registry_internal_url" {
   description = "URL HTTP interna do registry privado do cluster."
   value       = module.core_platform.registry_internal_url
+}
+
+# -------------------------------------------------------------------------
+# Workerless Security Guard — capability flags. The external API reads
+# these to report each capability as available or explicitly unavailable
+# (spec §12), never silently behaving as if a disabled feature were working.
+# Every value below resolves even when its module isn't instantiated.
+# -------------------------------------------------------------------------
+
+output "security_guard_grpc_enabled" {
+  value = var.security_guard_grpc_enabled
+}
+
+output "guard_grpc_service_name" {
+  value = var.security_guard_grpc_enabled ? module.security_guard_grpc[0].guard_grpc_service_name : null
+}
+
+output "guard_grpc_namespace" {
+  value = var.security_guard_grpc_enabled ? module.security_guard_grpc[0].guard_grpc_namespace : null
+}
+
+output "guard_grpc_port_output" {
+  value = var.security_guard_grpc_enabled ? module.security_guard_grpc[0].guard_grpc_port : null
+}
+
+output "tailscale_operator_enabled" {
+  value = var.tailscale_operator_enabled
+}
+
+output "tailscale_proxy_group_name" {
+  value = var.tailscale_operator_enabled ? module.tailscale_operator[0].proxy_group_name : null
+}
+
+output "cloudflare_operational_blocking_enabled" {
+  value = var.cloudflare_operational_blocking_enabled
+}
+
+output "cloudflare_guard_list_id" {
+  value = var.cloudflare_operational_blocking_enabled ? module.cloudflare_operational_blocking[0].cloudflare_guard_list_id : null
+}
+
+output "r2_evidence_enabled" {
+  value = var.r2_evidence_enabled
+}
+
+output "r2_evidence_bucket_name_output" {
+  value = var.r2_evidence_enabled ? module.security_evidence_r2[0].r2_evidence_bucket_name : null
+}
+
+output "security_datastore_acl_enabled" {
+  value = var.security_datastore_acl_enabled ? module.security_datastore_acl["enabled"].security_datastore_acl_enabled : false
+}
+
+output "security_monitoring_enabled" {
+  value = var.security_monitoring_enabled
+}
+
+output "security_monitoring_namespace" {
+  value = var.security_monitoring_enabled ? module.security_monitoring[0].namespace : null
 }

@@ -8,15 +8,9 @@ admin_cidrs = [
   "198.51.100.0/24",
 ]
 
-# Required. Public CIDR(s) of the host running the PaaS control-plane API
-# (e.g. workerless-api), authorized to reach the Kubernetes API (6443) and
-# Prometheus (prometheus_node_port) — but NOT SSH. Never use 0.0.0.0/0.
-control_plane_cidrs = [
-  "203.0.113.50/32",
-]
-
-# Must match platform/hetzner's prometheus_node_port.
-prometheus_node_port = 30090
+# Production uses the outbound-only Cloudflare Tunnel for the API.
+control_plane_cidrs = []
+prometheus_node_port = null
 
 server_type        = "cax11"
 worker_count       = 2
@@ -26,3 +20,17 @@ network_zone       = "us-east"
 
 etcd_snapshot_schedule_cron = "0 */6 * * *"
 etcd_snapshot_retention     = 14
+
+# Terraform uses SSH_AUTH_SOCK. Load the key before planning/applying:
+#   ssh-add ~/.ssh/id_rsa
+# No private-key passphrase is accepted by Terraform or stored in state.
+
+# Opt in one server at a time only after reviewing a plan with no server
+# replacement/deletion or IP/network/volume/type change.
+placement_group_members = {
+  "k3s-hetzner-rock-0"   = false
+  "k3s-hetzner-rock-1"   = false
+  "k3s-hetzner-rock-2"   = false
+  "k3s-hetzner-worker-0" = false
+  "k3s-hetzner-worker-1" = false
+}
